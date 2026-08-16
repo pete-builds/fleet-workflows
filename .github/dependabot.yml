@@ -1,0 +1,9 @@
+# Keeps the actions used INSIDE this repo (setup-python, checkout in smoke.yml) current.
+# Caller repos have their own dependabot entries that bump their pinned ref TO this repo.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: thursday

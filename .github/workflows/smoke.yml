@@ -1,0 +1,45 @@
+name: smoke
+
+# PERMANENT POSITIVE CONTROL for the lockfile-recompile action.
+#
+# smoke/requirements.lock is DELIBERATELY stale (six pinned below latest). Dispatching
+# this workflow must therefore always produce a change and open (or update) a PR on the
+# `lockfile-recompile` branch. A run that ends green with no PR means the action has
+# regressed into a silent no-op, which is exactly the failure mode a harness with no
+# positive control cannot see. Close the PR after reading it; never merge it, or the
+# control stops being a control.
+#
+# `uses: ./lockfile-recompile` tests HEAD of this repo, so run this BEFORE tagging a
+# release, and pin callers only to tags whose smoke passed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: lockfile-recompile
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./lockfile-recompile
+        with:
+          uv-version: '0.12.5'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require the PR that proves the action did something
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr="$(gh pr list --head lockfile-recompile --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "::error::smoke ran green but opened no PR: the action is a silent no-op"
+            exit 1
+          fi
+          echo "positive control satisfied: PR #$pr is open"
