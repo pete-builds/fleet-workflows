@@ -24,6 +24,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # BOTH DIRECTIONS, in one job, against the same stale fixture:
+  #   1. the drift check MUST FAIL on the stale lock (a check that cannot say no is not
+  #      a check), and
+  #   2. after fixing the lock in the working tree, the SAME check MUST PASS (a check
+  #      that cannot say yes is not a check either; a redaction pass that matches
+  #      nothing looks exactly like a clean one).
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Drift check against the stale control lock (must fail)
+        id: must_fail
+        continue-on-error: true
+        uses: ./lockfile-drift
+        with:
+          uv-version: '0.12.5'
+      - name: Require the failure
+        if: steps.must_fail.outcome != 'failure'
+        run: |
+          echo "::error::drift check passed on a deliberately stale lock: it can never say no"
+          exit 1
+      - name: Fix the lock in the working tree (no commit)
+        run: bash ./lockfile-recompile/recompile-locks.sh
+      - name: Drift check against the fixed lock (must pass)
+        uses: ./lockfile-drift
+        with:
+          uv-version: '0.12.5'
+
   smoke:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,34 @@
+name: lockfile-drift
+description: >-
+  Fail if any uv lockfile in the calling repo is stale: recompiles each lock from the
+  command recorded in its own header and diffs against what is committed, comments
+  stripped. Full recompile, not pin consistency, so transitive drift cannot hide. Read
+  only; opens nothing and needs no token.
+
+# THE PAIRED HALF OF lockfile-recompile. The check detects, the loop remediates, and the
+# two must resolve identically: same fresh-temp-path compile shape, same header-derived
+# command, and (via the caller's required uv-version input) the same pinned uv. A check
+# and a fixer that disagree about what "current" means produce permanent red PRs or
+# permanent silent drift, and this fleet has seen both.
+
+inputs:
+  uv-version:
+    description: >-
+      Exact uv version to install (e.g. "0.12.5"). REQUIRED, no default: it must match
+      the pin in this repo's lockfile-recompile caller, and the two bump together.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+
+    - name: Install uv (pinned by the caller; bump together with the recompile loop)
+      shell: bash
+      run: pip install "uv==${{ inputs.uv-version }}"
+
+    - name: Recompile every lock from its own header and diff
+      shell: bash
+      run: bash "${GITHUB_ACTION_PATH}/check-locks.sh"

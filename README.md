@@ -60,6 +60,39 @@ jobs:
 - Reports a package-level delta in the PR body: a large bump count is a dependency
   upgrade, not a lock sync, and deserves a real review.
 
+## lockfile-drift (composite action)
+
+The paired detection half of `lockfile-recompile`: recompiles every uv lock from the
+command in its own header and fails if the committed lock differs (comments stripped).
+Full recompile, not pin consistency, so transitive dependencies cannot drift silently:
+measured on this fleet's first recompile run, pin-consistency repos had drifted 1 to 35
+packages while full-recompile repos sat at 0 to 2. Read-only; needs no token.
+
+Caller usage (the whole per-repo file):
+
+```yaml
+name: lockfile-drift
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pete-builds/fleet-workflows/lockfile-drift@<FULL_COMMIT_SHA> # vX.Y.Z
+        with:
+          uv-version: '0.12.5'   # must match the lockfile-recompile caller's pin
+```
+
+The check and the loop must resolve identically: same fresh-temp-path compile shape, same
+header-derived command, same pinned uv. That agreement being structural (both read the
+lock's own header and compile fresh) rather than remembered is the point of sharing the
+implementation.
+
 ## Releasing a change
 
 1. Edit the action.
