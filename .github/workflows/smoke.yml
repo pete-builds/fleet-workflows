@@ -33,7 +33,7 @@ jobs:
   drift-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Drift check against the stale control lock (must fail)
         id: must_fail
         continue-on-error: true
@@ -55,7 +55,7 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./lockfile-recompile
         with:
           uv-version: '0.12.5'
