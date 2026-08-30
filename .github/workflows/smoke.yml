@@ -109,6 +109,11 @@ jobs:
               -f sha="$sha" -F force=true >/dev/null 2>&1 \
             || gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
                  -f ref=refs/heads/lockfile-recompile -f sha="$sha" >/dev/null
+          # Recorded NOW. The action checks out the branch and commits on it, so by the
+          # time the assertion step runs, HEAD is the action's own new commit and no
+          # longer the planted one. Reading it late made the assertion compare a value
+          # against itself and fail on a working action.
+          echo "planted_sha=$sha" >> "$GITHUB_ENV"
           echo "planted lockfile-recompile at $sha via the API"
 
       - name: Confirm the wedge conditions actually hold
@@ -137,10 +142,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          planted="$(git rev-parse HEAD)"
           remote="$(git ls-remote origin refs/heads/lockfile-recompile | cut -f1)"
-          if [ "$remote" = "$planted" ]; then
-            echo "::error::branch still points at the planted commit: the action did not push"
+          if [ "$remote" = "$planted_sha" ]; then
+            echo "::error::branch still points at the planted commit ${planted_sha}:"
+            echo "::error::the action did not push over the pre-existing branch."
             exit 1
           fi
           pr="$(gh pr list --head lockfile-recompile --state open --json number --jq '.[0].number // empty')"
