@@ -94,7 +94,22 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Plant the branch on the remote, as a merged-and-undeleted PR leaves it
-        run: git push --force origin "HEAD:refs/heads/lockfile-recompile"
+        # Planted through the API, deliberately, NOT with `git push`. A push also writes
+        # refs/remotes/origin/lockfile-recompile into this checkout, which is the exact
+        # thing whose absence causes the bug, so planting by push makes the bare lease
+        # resolve and the job goes green against the broken action. That is not a
+        # hypothetical: it is what the first version of this control did, and the
+        # precondition assertion below is what caught it.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/lockfile-recompile" \
+              -f sha="$sha" -F force=true >/dev/null 2>&1 \
+            || gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                 -f ref=refs/heads/lockfile-recompile -f sha="$sha" >/dev/null
+          echo "planted lockfile-recompile at $sha via the API"
 
       - name: Confirm the wedge conditions actually hold
         # A control on the control. If actions/checkout ever starts fetching every ref,
