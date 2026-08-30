@@ -68,6 +68,32 @@ runs:
 
         git config user.name  "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # THE 2026-08-29 WEDGE. actions/checkout fetches the default branch only, so
+        # refs/remotes/origin/lockfile-recompile does not exist locally. A bare
+        # --force-with-lease leases against that missing ref, and git refuses a push to
+        # a branch that DOES exist on the remote with:
+        #
+        #   ! [rejected] lockfile-recompile -> lockfile-recompile (stale info)
+        #
+        # which is fatal and permanent rather than transient, because the branch outlives
+        # the merge of its own PR (delete-branch-on-merge is off across the fleet) and
+        # every later run hits the identical wall. Measured: the 2026-08-28 weekly fire
+        # failed here in 10 of 13 caller repos, and the ref was present in 11 of 11
+        # repos checked. The loop was not slow or quiet, it was dead, and it had been
+        # reporting nothing at all because no tier watches scheduled runs on main.
+        #
+        # Fetch the branch so the lease has something real to lease against, then pass
+        # that SHA explicitly. Be precise about what this now guarantees: the lease
+        # window is the few seconds between this fetch and the push below, so it stops a
+        # genuine concurrent run and nothing more. It deliberately does NOT preserve
+        # hand-pushed commits on the branch; this loop regenerates from the default
+        # branch with --upgrade every time, so the lock it force-pushes is always
+        # equal-or-newer than whatever it replaces.
+        git fetch --no-tags --depth=1 origin \
+          "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null || true
+        lease="$(git rev-parse --verify --quiet "refs/remotes/origin/${branch}" || true)"
+
         git checkout -B "$branch"
         # Explicit paths, never `git add -A`: this step must be incapable of committing
         # anything the recompile step did not itself produce.
@@ -82,9 +108,14 @@ runs:
 
         uv: ${UV_VERSION}"
 
-        # --force-with-lease, not --force: if something else advanced this branch since
-        # the checkout, stop rather than discard it.
-        git push --force-with-lease origin "$branch"
+        # Explicit lease, never a bare --force-with-lease (see the wedge note above) and
+        # never a plain --force. When the branch is absent from the remote there is
+        # nothing to lease against and an ordinary push is the correct create.
+        if [ -n "$lease" ]; then
+          git push --force-with-lease="${branch}:${lease}" origin "$branch"
+        else
+          git push origin "$branch"
+        fi
 
         # %0A is how the script encodes newlines through GITHUB_OUTPUT, which is
         # single-line. Decoded here so the PR body reads as a list.

@@ -71,3 +71,63 @@ jobs:
             exit 1
           fi
           echo "positive control satisfied: PR #$pr is open"
+
+  # REGRESSION CONTROL for the 2026-08-29 wedge, and the reason this workflow now has
+  # three jobs instead of two.
+  #
+  # The `smoke` job above only ever proved the action works against a remote where the
+  # `lockfile-recompile` branch does NOT already exist. That is the first run in a repo
+  # and no other. From the second run onward the branch is always there, because closing
+  # or merging its PR leaves the ref behind, and a bare --force-with-lease against a
+  # branch with no local tracking ref is refused as "(stale info)". So the action was
+  # broken in every caller repo from its second scheduled fire, and the harness could
+  # not see it: the control was testing the one case that never recurs.
+  #
+  # This job reproduces the recurring case. It fails on the pre-fix action.
+  rerun-over-an-existing-branch:
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Plant the branch on the remote, as a merged-and-undeleted PR leaves it
+        run: git push --force origin "HEAD:refs/heads/lockfile-recompile"
+
+      - name: Confirm the wedge conditions actually hold
+        # A control on the control. If actions/checkout ever starts fetching every ref,
+        # the tracking ref would exist, the bare lease would resolve, and this job would
+        # go green while testing nothing at all. That is the precise shape of a guard
+        # that looks present and does nothing, so assert the precondition rather than
+        # assuming it.
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --heads origin lockfile-recompile >/dev/null \
+            || { echo "::error::planted branch is not on the remote; control is broken"; exit 1; }
+          if git rev-parse --verify --quiet refs/remotes/origin/lockfile-recompile >/dev/null; then
+            echo "::error::a local tracking ref exists, so this job no longer reproduces the wedge"
+            exit 1
+          fi
+          echo "OK: remote branch present, local tracking ref absent. This is the failing case."
+
+      - uses: ./lockfile-recompile
+        with:
+          uv-version: '0.12.5'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require the push to have survived an already-existing branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          planted="$(git rev-parse HEAD)"
+          remote="$(git ls-remote origin refs/heads/lockfile-recompile | cut -f1)"
+          if [ "$remote" = "$planted" ]; then
+            echo "::error::branch still points at the planted commit: the action did not push"
+            exit 1
+          fi
+          pr="$(gh pr list --head lockfile-recompile --state open --json number --jq '.[0].number // empty')"
+          [ -n "$pr" ] || { echo "::error::no PR after rerun over an existing branch"; exit 1; }
+          echo "regression control satisfied: branch advanced to ${remote}, PR #$pr open"
