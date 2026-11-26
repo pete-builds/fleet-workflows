@@ -93,6 +93,16 @@ header-derived command, same pinned uv. That agreement being structural (both re
 lock's own header and compile fresh) rather than remembered is the point of sharing the
 implementation.
 
+## Releasing a change
+
+1. Edit the action.
+2. Dispatch the `smoke` workflow. `smoke/requirements.lock` is deliberately stale, so a
+   correct action ALWAYS opens or updates a PR on `lockfile-recompile`; the run fails if
+   it does not. That is the positive control: a green smoke with no PR can not happen.
+   Close the smoke PR after reading it. Never merge it, or the control stops controlling.
+3. Tag a release (`vX.Y.Z`). Dependabot in each caller repo picks up the new tag and
+   opens per-repo SHA-bump PRs.
+
 ## Halt switch
 
 One flag that stops every unattended writer in the fleet at once.
@@ -140,16 +150,6 @@ and ends green.
 `halt-drill/CLEAR-does-not-exist` never does (reads clear while `ALIVE` answers). The
 `halt-smoke` workflow runs every outcome on every push and pull request, including a
 recompile that must write nothing when halted and must reach its write step when clear.
-
-## Releasing a change
-
-1. Edit the action.
-2. Dispatch the `smoke` workflow. `smoke/requirements.lock` is deliberately stale, so a
-   correct action ALWAYS opens or updates a PR on `lockfile-recompile`; the run fails if
-   it does not. That is the positive control: a green smoke with no PR can not happen.
-   Close the smoke PR after reading it. Never merge it, or the control stops controlling.
-3. Tag a release (`vX.Y.Z`). Dependabot in each caller repo picks up the new tag and
-   opens per-repo SHA-bump PRs.
 
 ## What does not belong here
 
