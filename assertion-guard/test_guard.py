@@ -650,19 +650,25 @@ class CollectionDiffTests(unittest.TestCase):
     def lost(out):
         return sorted(ln.split("`")[1] for ln in out if ln.startswith("test-deleted\t"))
 
+    @staticmethod
+    def ids(*names):
+        """What `pytest --collect-only -q` prints: the IDs, then its own count line."""
+        tail = f"{len(names)} tests collected in 0.01s" if names else "no tests collected in 0.01s"
+        return "".join(n + "\n" for n in names) + "\n" + tail + "\n"
+
     T = "def test_a():\n    assert f() == 1\n"
 
     def test_every_lost_id_is_reported(self):
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_a\ntests/test_a.py::test_b\n"}
-        a = {"COLLECT.txt": "tests/test_a.py::test_a\n"}
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("tests/test_a.py::test_a", "tests/test_a.py::test_b")}
+        a = {"COLLECT.txt": self.ids("tests/test_a.py::test_a")}
         rc, out = self.run_collect(b, a)
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.lost(out), ["tests/test_a.py::test_b"])
-        self.assertIn("test deletions checked by the runner (2 collected at the merge base, 1 at head)", out[-1])
+        self.assertIn("test deletions checked by the runner for Python (2 collected at the merge base, 1 at head)", out[-1])
 
     def test_a_rename_is_red_and_both_ids_are_listed(self):
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_old\n"}
-        a = {"tests/test_a.py": self.T.replace("test_a", "test_new"), "COLLECT.txt": "tests/test_a.py::test_new\n"}
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("tests/test_a.py::test_old")}
+        a = {"tests/test_a.py": self.T.replace("test_a", "test_new"), "COLLECT.txt": self.ids("tests/test_a.py::test_new")}
         rc, out = self.run_collect(b, a)
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.lost(out), ["tests/test_a.py::test_old"])
@@ -672,8 +678,8 @@ class CollectionDiffTests(unittest.TestCase):
     def test_a_move_that_keeps_the_name_is_still_red(self):
         # The same test name collected somewhere else is not the same test: no excusal by
         # name, class or file (round three H6, H13). Both IDs listed, the run red.
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_x\ntests/test_b.py::test_y\n"}
-        a = {"COLLECT.txt": "tests/test_b.py::test_y\ntests/test_b.py::TestMoved::test_x\n"}
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("tests/test_a.py::test_x", "tests/test_b.py::test_y")}
+        a = {"COLLECT.txt": self.ids("tests/test_b.py::test_y", "tests/test_b.py::TestMoved::test_x")}
         rc, out = self.run_collect(b, a)
         self.assertEqual((rc, self.lost(out)), (1, ["tests/test_a.py::test_x"]))
         self.assertIn("  + tests/test_b.py::TestMoved::test_x", out)
@@ -694,11 +700,11 @@ class CollectionDiffTests(unittest.TestCase):
                 git(tmp, "commit", "-qm", msg)
                 return git(tmp, "rev-parse", "HEAD").strip()
 
-            commit("t.py::t1\n", "branch point")
+            commit(self.ids("t.py::t1"), "branch point")
             git(tmp, "checkout", "-q", "-b", "pr")
-            head = commit("t.py::t1\nt.py::t2\n", "pr adds t2")
+            head = commit(self.ids("t.py::t1", "t.py::t2"), "pr adds t2")
             git(tmp, "checkout", "-q", "main")
-            base = commit("t.py::t1\nt.py::t3\n", "main adds t3 later")
+            base = commit(self.ids("t.py::t1", "t.py::t3"), "main adds t3 later")
             rc, out = run_main(["--base", base, "--head", head, "--collect-command", self.CMD,
                                 "--no-annotations", "--summary-file", ""], cwd=tmp)
             self.assertEqual(rc, 0, out)
@@ -707,8 +713,8 @@ class CollectionDiffTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_no_excusal_even_when_the_code_file_is_deleted(self):
-        b = {"src/calc.py": "x = 1\n", "tests/test_calc.py": self.T, "COLLECT.txt": "tests/test_calc.py::test_a\n"}
-        a = {"src/calc.py": None, "tests/test_calc.py": None, "COLLECT.txt": ""}
+        b = {"src/calc.py": "x = 1\n", "tests/test_calc.py": self.T, "COLLECT.txt": self.ids("tests/test_calc.py::test_a")}
+        a = {"src/calc.py": None, "tests/test_calc.py": None, "COLLECT.txt": self.ids()}
         rc, out = self.run_collect(b, a)
         self.assertEqual(self.lost(out), ["tests/test_calc.py::test_a"])
         self.assertEqual(rc, 1)
@@ -717,28 +723,49 @@ class CollectionDiffTests(unittest.TestCase):
         # The diff deletes a test file, but the runner still collects the same IDs (say the
         # tests live on elsewhere): no test-deleted. And the reverse: nothing in the diff
         # removes a test, but the runner lost one: red.
-        b = {"tests/test_a.py": self.T, "tests/test_b.py": self.T, "COLLECT.txt": "x.py::t1\n"}
+        b = {"tests/test_a.py": self.T, "tests/test_b.py": self.T, "COLLECT.txt": self.ids("x.py::t1", "x.py::t2")}
         rc, out = self.run_collect(b, {"tests/test_b.py": None})
         self.assertEqual(rc, 0, out)
-        rc, out = self.run_collect(b, {"COLLECT.txt": ""})
+        rc, out = self.run_collect(b, {"COLLECT.txt": self.ids("x.py::t2")})
         self.assertEqual((rc, self.lost(out)), (1, ["x.py::t1"]))
 
     def test_added_only_is_green(self):
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
-        rc, out = self.run_collect(b, {"COLLECT.txt": "t.py::a\nt.py::b\n"})
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("t.py::a")}
+        rc, out = self.run_collect(b, {"COLLECT.txt": self.ids("t.py::a", "t.py::b")})
         self.assertEqual(rc, 0, out)
         self.assertIn("test IDs added by this change (new tests):", out)
 
     def test_collection_failure_is_exit_2_with_the_runner_tail(self):
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
-        rc, out = self.run_collect(b, {"COLLECT.txt": "t.py::a\n"}, cmd="echo 'ImportError: boom' >&2; exit 4")
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("t.py::a")}
+        rc, out = self.run_collect(b, {"COLLECT.txt": self.ids("t.py::a")}, cmd="echo 'ImportError: boom' >&2; exit 4")
         self.assertEqual(rc, 2, out)
         self.assertIn("ImportError: boom", "\n".join(out))
         self.assertTrue(out[-1].startswith("assertion-guard: ERROR:"), out)
 
+    def test_a_failing_runner_is_never_read_as_empty(self):
+        # A second, independent guard on "a failed collection reads as empty" (review round
+        # four, item 7): the runner prints valid IDs and its count, THEN fails. In a repo
+        # with no test files the coverage check cannot rescue it, so only the exit-code
+        # check stands between this and a green run.
+        b = {"COLLECT.txt": self.ids("t.py::a")}
+        rc, out = self.run_collect(b, {"COLLECT.txt": self.ids("t.py::a", "t.py::b")}, cmd="cat COLLECT.txt; exit 3")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("failed (exit 3)", "\n".join(out))
+
+    def test_a_base_only_failure_says_a_human_must_merge(self):
+        b = {"tests/test_a.py": self.T, "BROKEN": "x\n", "COLLECT.txt": self.ids("t.py::a")}
+        a = {"BROKEN": None}
+        rc, out = self.run_collect(b, a, cmd="test -f BROKEN && { echo 'ModuleNotFoundError: old.path' >&2; exit 4; }; cat COLLECT.txt")
+        self.assertEqual(rc, 2, out)
+        text = "\n".join(out)
+        self.assertIn("a dependency change broke collection at the merge base; a human must merge this", text)
+        self.assertIn("ModuleNotFoundError: old.path", text)
+
     def test_pytest_exit_5_means_nothing_collected(self):
-        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
-        rc, out = self.run_collect(b, {"COLLECT.txt": ""}, cmd="cat COLLECT.txt; test -s COLLECT.txt || exit 5")
+        # The head deleted the last test file: nothing to collect is a real empty set there.
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("t.py::a")}
+        rc, out = self.run_collect(b, {"tests/test_a.py": None, "COLLECT.txt": self.ids()},
+                                   cmd="cat COLLECT.txt; grep -q '::' COLLECT.txt || exit 5")
         self.assertEqual((rc, self.lost(out)), (1, ["t.py::a"]))
 
     def test_unreadable_collect_output_is_exit_2(self):
@@ -746,6 +773,111 @@ class CollectionDiffTests(unittest.TestCase):
         rc, out = self.run_collect(b, {"COLLECT.txt": "<Module test_a.py>\n2 tests collected\n"})
         self.assertEqual(rc, 2, out)
         self.assertIn("no test ID could be read", "\n".join(out))
+
+    # ---- review round four: input sanity -----------------------------------------------
+
+    def test_f1_zero_ids_with_test_files_is_exit_2(self):
+        # `true`, `echo`, `-qq`, `-p no:terminal`, `vitest list nosuchdir`: nothing read,
+        # yet the tree has tests. That is not "the runner checked and found nothing".
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "anything\n"}
+        for cmd in ("true", "echo tests collected fine", "printf 'tests/test_a.py: 4\\n'"):
+            with self.subTest(cmd=cmd):
+                rc, out = self.run_collect(b, {"tests/test_a.py": self.T + "\n"}, cmd=cmd)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("collects nothing", "\n".join(out))
+
+    def test_f1_everything_deselected_is_exit_2(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "\nno tests collected (4 deselected) in 0.01s\n"}
+        rc, out = self.run_collect(b, {"tests/test_a.py": self.T + "\n"}, cmd="cat COLLECT.txt; exit 5")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("every test was deselected at both ends", "\n".join(out))
+
+    def test_f1_a_pr_that_deselects_everything_itself_is_every_test_lost(self):
+        # Deselecting at the head only is the PR hiding its tests: red, with every lost ID.
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("t.py::a", "t.py::b")}
+        a = {"COLLECT.txt": "\nno tests collected (2 deselected) in 0.01s\n"}
+        rc, out = self.run_collect(b, a, cmd="cat COLLECT.txt; grep -q '::' COLLECT.txt || exit 5")
+        self.assertEqual((rc, self.lost(out)), (1, ["t.py::a", "t.py::b"]))
+
+    def test_f1_no_test_files_at_the_base_is_still_green(self):
+        # This PR's own shape: the merge base has no tests at all, the head adds them.
+        b = {"README.md": "x\n", "COLLECT.txt": self.ids()}
+        a = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("tests/test_a.py::test_a")}
+        rc, out = self.run_collect(b, a, cmd="cat COLLECT.txt; grep -q '::' COLLECT.txt || exit 5")
+        self.assertEqual(rc, 0, out)
+
+    def test_f1_a_pr_that_hides_every_test_is_red_not_unreadable(self):
+        # H1, H10, H12: the base collects, the head collects nothing although its tree has
+        # test files. That is every ID lost (exit 1 with the IDs), not an unreadable run.
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("tests/test_a.py::test_a")}
+        rc, out = self.run_collect(b, {"tests/test_a.py": self.T + "\n", "COLLECT.txt": "\n"})
+        self.assertEqual((rc, self.lost(out)), (1, ["tests/test_a.py::test_a"]))
+
+    def test_f3_count_must_match_and_be_present(self):
+        b = {"tests/test_a.py": self.T,
+             "COLLECT.txt": "t.py::a\nt.py::b\nt.py::c\n\n7 tests collected in 0.01s\n"}
+        rc, out = self.run_collect(b, {"tests/test_a.py": self.T + "\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("pytest reported 7 tests collected but 3 test IDs could be read", "\n".join(out))
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\nt.py::b\n"}  # cut, e.g. `| head`
+        rc, out = self.run_collect(b, {"tests/test_a.py": self.T + "\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no 'N tests collected' line", "\n".join(out))
+
+    def test_f3_paths_with_spaces_and_odd_ids(self):
+        out = ("tests/my dir/test_b.py::test_spaced_keep\ntests/test_a.py::test_odd_ids[a::b]\n"
+               "tests/test_a.py::test_odd_ids[c d]\ntests/test_a.py::test_odd_ids[[e]]\n\n"
+               "=== warnings summary ===\ntests/test_a.py:3\n  /x/tests/test_a.py:3: UserWarning\n"
+               "\n4 tests collected in 0.00s\n")
+        self.assertEqual(guard.parse_collected_list(out), [
+            "tests/my dir/test_b.py::test_spaced_keep", "tests/test_a.py::test_odd_ids[a::b]",
+            "tests/test_a.py::test_odd_ids[c d]", "tests/test_a.py::test_odd_ids[[e]]"])
+        guard.check_collected(out, out, guard.parse_collected_list(out), "base")  # adds up: no error
+        self.assertEqual(guard.parse_collected_list("test/my dir/b.test.ts > spaced keep\n"),
+                         ["test/my dir/b.test.ts > spaced keep"])
+
+    def test_f3_vitest_lines_must_all_be_ids(self):
+        # `vitest list --filesOnly` or `--json`: no ID at all, test files in the tree.
+        b = {"test/a.test.ts": "it('one', () => {})\n", "COLLECT.txt": "test/a.test.ts\n"}
+        rc, out = self.run_collect(b, {"test/a.test.ts": "it('one', () => {})\n\n"})
+        self.assertEqual(rc, 2, out)
+        mixed = "test/a.test.ts > one\nsomething else\n"
+        with self.assertRaises(guard.CollectionError):
+            guard.check_collected(mixed, mixed, guard.parse_collected_list(mixed), "base")
+
+    def test_f3_a_duplicate_vitest_line_counts_twice(self):
+        # Two `it('one')` print the same line twice; deleting one must still be lost.
+        b = {"src/a.test.ts": "it('one', () => {})\nit('one', () => {})\n",
+             "COLLECT.txt": "src/a.test.ts > one\nsrc/a.test.ts > one\n"}
+        rc, out = self.run_collect(b, {"src/a.test.ts": "it('one', () => {})\n", "COLLECT.txt": "src/a.test.ts > one\n"})
+        self.assertEqual((rc, self.lost(out)), (1, ["src/a.test.ts > one"]))
+
+    def test_f2_a_language_the_runner_did_not_cover_stays_static(self):
+        # A Python collect command in a repo that also has vitest tests: the folded-away
+        # vitest test is still caught, statically, and the verdict says so (casepoly.sh).
+        js = "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n})\n\nit('important', () => {\n  expect(add(2, 2)).toBe(4)\n})\n"
+        b = {"tests/test_a.py": self.T, "web/test/ui.test.ts": js, "COLLECT.txt": self.ids("tests/test_a.py::test_a")}
+        a = {"web/test/ui.test.ts": "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n  expect(add(2, 2)).toBe(4)\n})\n"}
+        rc, out = self.run_collect(b, a)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("test-deleted\tweb/test/ui.test.ts", "\n".join(out))
+        self.assertIn("checked by the runner for Python", out[-1])
+        self.assertIn("statically for TS/JS, not by the runner", out[-1])
+
+    def test_f5_pytest_addopts_is_unset_for_collection_and_named(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": self.ids("t.py::a")}
+        old = os.environ.get("PYTEST_ADDOPTS")
+        os.environ["PYTEST_ADDOPTS"] = "-k nomatch"
+        try:
+            rc, out = self.run_collect(b, {"COLLECT.txt": self.ids("t.py::a", "t.py::b")},
+                                       cmd='test -z "$PYTEST_ADDOPTS" || exit 3; cat COLLECT.txt')
+        finally:
+            if old is None:
+                os.environ.pop("PYTEST_ADDOPTS")
+            else:
+                os.environ["PYTEST_ADDOPTS"] = old
+        self.assertEqual(rc, 0, out)
+        self.assertIn("collection environment: PYTEST_ADDOPTS=-k nomatch (ignored for collection)", out)
 
     def test_collect_command_needs_git_mode(self):
         rc, out = run_main(["--diff-file", os.path.join(FIXTURES, "weakened.diff"),
@@ -784,6 +916,17 @@ class CollectionConfigTests(unittest.TestCase):
         ):
             with self.subTest(after=after):
                 self.assertIn("collection-config-changed", kinds(findings(before, after)))
+
+    def test_a_workflow_that_changes_the_guard_setup_is_named(self):
+        # Review round four, F4: editing collect-command in a workflow changes what the
+        # collection diff sees, so it is named like any other collection config change.
+        wf = ".github/workflows/assertion-guard.yml"
+        b = {wf: "jobs:\n  g:\n    steps:\n      - uses: x/assertion-guard@abc\n        with:\n"
+                 "          collect-command: python -m pytest --collect-only -q\n"}
+        a = {wf: b[wf].replace("--collect-only -q", "--collect-only -q -k fast")}
+        self.assertIn("collection-config-changed", kinds(findings(b, a)))
+        other = {".github/workflows/ci.yml": "on: push\n"}
+        self.assertEqual(findings(other, {".github/workflows/ci.yml": "on: pull_request\n"}), [])
 
     def test_unrelated_config_is_quiet(self):
         b = {"pyproject.toml": '[project]\nname = "x"\n'}

@@ -109,7 +109,28 @@ so tests main gained after the branch point are not counted) and the head in sep
 worktrees, runs the command in each, diffs the test IDs the runner prints (pytest node IDs, parametrize IDs included;
 `vitest list` lines), and reports every ID present at the base and missing at the head
 as `test-deleted`, with the full ID. If collection fails at either end, the guard exits 2
-with the runner's own error, never a quiet fallback.
+with the runner's own error, never a quiet fallback. If only the merge base fails, the
+message says so: "a dependency change broke collection at the merge base; a human must
+merge this".
+
+The guard also refuses runner output that does not add up, with exit 2:
+
+- no test ID at either end while either commit has test files: the command is not
+  collecting (`-k` or `-m` that matches nothing, `-qq`, `vitest list --json` or
+  `--filesOnly`, a wrong path, `true`). Zero at ONE end is a real answer: a PR that hides
+  every test is every ID lost, red;
+- pytest IDs that do not match pytest's own `N tests collected` line, or no such line
+  (output cut by `| head`, or the reporter turned off);
+- vitest output with lines that are not test IDs.
+
+`PYTEST_ADDOPTS` is unset for collection, and any `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` or
+`VITEST_*` variable present is named in the summary.
+
+**Two runners.** The runner decides deletions only for the languages it reported IDs for;
+any other language keeps the static rules, and the verdict names both (`checked by the
+runner for Python (...); statically for TS/JS, not by the runner`). To have the runner
+decide for both, chain the collectors in one command, so each prints its own lines:
+`collect-command: python -m pytest --collect-only -q && npx vitest list`.
 
 **There are no excusals.** A renamed, moved or consolidated test shows up as a lost ID
 plus a new one. Both are listed in the summary under "renamed or consolidated? A human
@@ -131,7 +152,7 @@ collect-command`. That is a fallback, not full coverage.
 | Finding | Meaning |
 |---|---|
 | `test-deleted` | a test ID the runner collected at the base is not collected at the head (static fallback: a removed test not re-added where it is collected) |
-| `collection-config-changed` | a changed line in `testpaths`, `python_files`, `python_classes`, `python_functions`, `norecursedirs`, `addopts` with `--ignore`, `--deselect` or `-k`, `collect_ignore` in a conftest, or vitest/jest `include`, `exclude`, `testMatch`: the collection diff shows the effect, this names the cause |
+| `collection-config-changed` | a changed line in `testpaths`, `python_files`, `python_classes`, `python_functions`, `norecursedirs`, `addopts` with `--ignore`, `--deselect` or `-k`, `collect_ignore` in a conftest, vitest/jest `include`, `exclude`, `testMatch`, or a workflow line naming `collect-command`, `collect-setup` or `assertion-guard`: the collection diff shows the effect, this names the cause |
 | `net-assertion-loss` | a test file that still exists loses more assertions than it gains (mock `assert_called*` and friends count) |
 | `loosened-assertion` | an exact check became a weaker one: `==` to `is not None` or `>=`, `toEqual` to `toBeDefined`, `toHaveBeenCalledWith` to `toHaveBeenCalled`, a specific error to `Exception`, `assertRaisesRegex` to `assertRaises`, `toThrow('msg')` to `toThrow()`, a wider `approx` tolerance, fewer `toBeCloseTo` digits; or an added check over constants only (`assert 3 == 3`) |
 | `skip-added` | a skip or xfail on an existing test, or a `.only` anywhere |
@@ -144,7 +165,7 @@ as binary is an error.
 Each finding is an `::error` annotation, a row in the step summary, and exit 1. The last
 line is always a verdict and names how deletions were checked:
 `assertion-guard: N finding(s) in M test file(s) scanned; test deletions checked by the
-runner (B collected at the merge base, H at head)`. A run that could not read the diff, or whose
+runner for Python (B collected at the merge base, H at head)`. A run that could not read the diff, or whose
 runner could not collect, prints `assertion-guard: ERROR: ...` and exits 2. There is no
 override label or keyword: a red guard is meant to be read by the reviewer, who merges past
 it only with a written reason.
@@ -185,8 +206,10 @@ The action's outputs are `exit-code` (0, 1 or 2), `verdict` and `kinds`.
 
 - unit tests, including the collection diff against a fake runner, so a mutation of the
   rule fails a unit test, not only a fixture;
-- `runner_cases.py`: every round-three case (H1 to H13, J1 to J3), the earlier R and T
-  series, and a collection failure, against pytest 9.2.0 and vitest 3.2.4 pinned in
+- `runner_cases.py`: every round-three case (H1 to H13, J1 to J3), every round-four case
+  script (neutralised collect commands, spaced paths, odd IDs, vitest variants, a polyglot
+  repo), the earlier R and T series, and a collection failure, against pytest 9.2.0 and
+  vitest 3.2.4 pinned in
   `smoke/assertion-guard/runner-py` and `runner-js`. Each case's lost IDs must equal what
   the runner itself reports when the script runs it directly, and the recorded-ID replay
   must print identically;

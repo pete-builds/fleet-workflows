@@ -66,7 +66,7 @@ def ground_truth(d, js):
     return {ln.strip() for ln in p.stdout.splitlines() if "::" in ln and not ln.startswith(" ")}, p.returncode
 
 
-def run_case(work, name, before, after, js):
+def run_case(work, name, before, after, js, cmd=None):
     d = os.path.join(work, name)
     os.makedirs(d)
     sh(d, "git", "init", "-q", "-b", "main")
@@ -85,7 +85,7 @@ def run_case(work, name, before, after, js):
     gt_head, _ = ground_truth(d, js)
     ids = d + ".ids"
     g = sh(d, sys.executable, "-B", GUARD, "--base", "main~1", "--head", "main",
-           "--collect-command", JS_COLLECT if js else PY_COLLECT, "--ids-out", ids,
+           "--collect-command", cmd or (JS_COLLECT if js else PY_COLLECT), "--ids-out", ids,
            "--no-annotations", "--summary-file", "")
     diff = sh(d, "git", "diff", "--no-color", "-M", "main~1...main").stdout
     with open(d + ".diff", "w") as fh:
@@ -307,6 +307,109 @@ fail_cases = [
 ]
 
 # ======================================================================================
+# Round-four review cases (review-fw-6-r4: case1.sh, case5.sh, casejs.sh, casejs3.sh,
+# casepoly.sh). File contents copied from the scripts; each script's runs are cases here.
+# ======================================================================================
+R4_PY_BASE = {
+    "tests/test_a.py": ("import pytest\n\ndef test_one():\n    assert 1 == 1\n\ndef test_important():\n"
+                        "    assert 2 + 2 == 4\n\n@pytest.mark.parametrize(\"x\", [1, 2])\ndef test_param(x):\n"
+                        "    assert x > 0\n"),
+    "pyproject.toml": "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+}
+R4_PY_HEAD = {"tests/test_a.py": R4_PY_BASE["tests/test_a.py"].replace(
+    "def test_important():\n    assert 2 + 2 == 4\n\n", "")}
+R4_PYQ = f'"{PY}" -m pytest --collect-only -q'
+r4_cases = [
+    ("r4-case1-plain", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ),
+    ("r4-case1-nosuchdir", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ + " nosuchdir"),
+    ("r4-case1-k-nomatch", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ + " -k nomatch"),
+    ("r4-case1-qq", R4_PY_BASE, R4_PY_HEAD, False, f'"{PY}" -m pytest --collect-only -qq'),
+    ("r4-case1-no-terminal", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ + " -p no:terminal"),
+    ("r4-case1-head-3", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ + " | head -3"),
+    ("r4-case1-m-slow", R4_PY_BASE, R4_PY_HEAD, False, R4_PYQ + " --co -m slow"),
+    ("r4-case1-echo", R4_PY_BASE, R4_PY_HEAD, False, "echo tests collected fine"),
+    ("r4-case1-true", R4_PY_BASE, R4_PY_HEAD, False, "true"),
+]
+R4_C5_A = ('import pytest, warnings\n\nwarnings.warn("collection-time warning", UserWarning)\n\n'
+           'def test_one():\n    assert True\n\n'
+           '@pytest.mark.parametrize("v", ["a::b", "c d", "[e]", "x\\ny"], ids=["a::b", "c d", "[e]", None])\n'
+           'def test_odd_ids(v):\n    assert v\n')
+R4_C5_B = ("def test_spaced_keep():\n    assert True\n\ndef test_spaced_important():\n"
+           "    assert 1 + 1 == 2\n")
+r4_cases.append(("r4-case5-spaced-path-and-odd-ids",
+                 {"pyproject.toml": R4_PY_BASE["pyproject.toml"], "tests/test_a.py": R4_C5_A,
+                  "tests/my dir/test_b.py": R4_C5_B},
+                 {"tests/my dir/test_b.py": R4_C5_B.replace("def test_spaced_important():\n    assert 1 + 1 == 2\n", ""),
+                  "tests/test_a.py": R4_C5_A.replace('"[e]", "x\\ny"]', '"[e]"]').replace('"[e]", None]', '"[e]"]')},
+                 False, R4_PYQ))
+R4_JS_PKG = {"package.json": open(os.path.join(HERE, "runner-js", "package.json")).read()}
+R4_JS_A = ("import { describe, it, expect } from 'vitest'\ndescribe('math', () => {\n"
+           "  it('one', () => { expect(1).toBe(1) })\n  it('important', () => { expect(2 + 2).toBe(4) })\n})\n")
+R4_JS_B = ("import { it, expect } from 'vitest'\nit('spaced keep', () => { expect(1).toBe(1) })\n"
+           "it('spaced important', () => { expect(1).toBe(1) })\n")
+R4_JS_BASE = {**R4_JS_PKG, "test/a.test.ts": R4_JS_A, "test/my dir/b.test.ts": R4_JS_B}
+R4_JS_F1 = {"test/a.test.ts": "".join(ln for ln in R4_JS_A.splitlines(True) if "'important'" not in ln)}
+R4_JS_F2 = {"test/my dir/b.test.ts": "".join(ln for ln in R4_JS_B.splitlines(True) if "'spaced important'" not in ln)}
+R4_VL = f'"{VITEST}" list'
+r4_cases += [
+    ("r4-casejs-feature", R4_JS_BASE, R4_JS_F1, True, R4_VL),
+    ("r4-casejs-feature2-spaced", R4_JS_BASE, R4_JS_F2, True, R4_VL),
+    ("r4-casejs-json", R4_JS_BASE, R4_JS_F1, True, R4_VL + " --json"),
+    ("r4-casejs-t-nomatch", R4_JS_BASE, R4_JS_F1, True, R4_VL + " -t nomatch"),
+    ("r4-casejs-filesOnly", R4_JS_BASE, R4_JS_F1, True, R4_VL + " --filesOnly"),
+    ("r4-casejs-nosuchdir", R4_JS_BASE, R4_JS_F1, True, R4_VL + " nosuchdir"),
+]
+R4_J3 = ("import { it, expect } from 'vitest'\nconst add = (a: number, b: number) => a + b\n\n"
+         "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n})\n\n"
+         "it('important', () => {\n  expect(add(2, 2)).toBe(4)\n})\n")
+R4_J3_FOLD = ("import { it, expect } from 'vitest'\nconst add = (a: number, b: number) => a + b\n\n"
+              "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n  expect(add(2, 2)).toBe(4)\n})\n")
+R4_J3_BASE = {**R4_JS_PKG, "test/my dir/b.test.ts": R4_J3, "test/c.test.ts": R4_J3}
+r4_cases += [
+    ("r4-casejs3-plain", R4_J3_BASE, {"test/c.test.ts": R4_J3_FOLD}, True, R4_VL),
+    ("r4-casejs3-spaced", R4_J3_BASE, {"test/my dir/b.test.ts": R4_J3_FOLD}, True, R4_VL),
+    ("r4-casejs3-nosuchdir", R4_J3_BASE, {"test/c.test.ts": R4_J3_FOLD}, True, R4_VL + " nosuchdir"),
+    ("r4-casejs3-t-nomatch", R4_J3_BASE, {"test/c.test.ts": R4_J3_FOLD}, True, R4_VL + " -t nomatch"),
+    ("r4-casejs3-json", R4_J3_BASE, {"test/c.test.ts": R4_J3_FOLD}, True, R4_VL + " --json"),
+]
+R4_POLY_UI = ("import { it, expect } from 'vitest'\nimport { add } from '../src/add'\n\n"
+              "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n})\n\n"
+              "it('important', () => {\n  expect(add(2, 2)).toBe(4)\n})\n")
+R4_POLY_FOLD = ("import { it, expect } from 'vitest'\nimport { add } from '../src/add'\n\n"
+                "it('keep', () => {\n  expect(add(1, 1)).toBe(2)\n  expect(add(2, 2)).toBe(4)\n})\n")
+r4_cases.append(("r4-casepoly-python-runner-js-fold", {**R4_PY_BASE, "web/test/ui.test.ts": R4_POLY_UI},
+                 {"web/test/ui.test.ts": R4_POLY_FOLD}, False, R4_PYQ))
+
+TD = "test-deleted"
+NOTHING = "the collect command collects nothing"
+EXPECT_R4 = {
+    "r4-case1-plain": (1, [TD], ["tests/test_a.py::test_important"], ""),
+    "r4-case1-nosuchdir": (2, [], [], "", "failed (exit 4)"),
+    "r4-case1-k-nomatch": (2, [], [], "", "every test was deselected at both ends"),
+    "r4-case1-qq": (2, [], [], "", NOTHING),
+    "r4-case1-no-terminal": (2, [], [], "", "failed (exit 4)"),
+    "r4-case1-head-3": (2, [], [], "", "no 'N tests collected' line"),
+    "r4-case1-m-slow": (2, [], [], "", "every test was deselected at both ends"),
+    "r4-case1-echo": (2, [], [], "", NOTHING),
+    "r4-case1-true": (2, [], [], "", NOTHING),
+    "r4-case5-spaced-path-and-odd-ids": (1, [TD, TD], ["tests/my dir/test_b.py::test_spaced_important",
+                                                       "tests/test_a.py::test_odd_ids[x\\ny]"], ""),
+    "r4-casejs-feature": (1, [TD, "net-assertion-loss"], ["test/a.test.ts > math > important"], ""),
+    "r4-casejs-feature2-spaced": (1, [TD, "net-assertion-loss"], ["test/my dir/b.test.ts > spaced important"], ""),
+    "r4-casejs-json": (2, [], [], "", NOTHING),
+    "r4-casejs-t-nomatch": (2, [], [], "", NOTHING),
+    "r4-casejs-filesOnly": (2, [], [], "", NOTHING),
+    "r4-casejs-nosuchdir": (2, [], [], "", NOTHING),
+    "r4-casejs3-plain": (1, [TD], ["test/c.test.ts > important"], ""),
+    "r4-casejs3-spaced": (1, [TD], ["test/my dir/b.test.ts > important"], ""),
+    "r4-casejs3-nosuchdir": (2, [], [], "", NOTHING),
+    "r4-casejs3-t-nomatch": (2, [], [], "", NOTHING),
+    "r4-casejs3-json": (2, [], [], "", NOTHING),
+    "r4-casepoly-python-runner-js-fold": (1, [TD], [], "the JS test is caught statically",
+                                          "statically for TS/JS, not by the runner"),
+}
+
+# ======================================================================================
 # EXPECT: (exit code, sorted finding types, sorted lost IDs, note)
 # ======================================================================================
 TD = "test-deleted"
@@ -374,12 +477,13 @@ def main():
         print(f"::error::runner missing, so the collection fixtures cannot run: {missing}")
         print("assertion-guard runner cases: FAIL (no runner)")
         return 1
-    all_cases = py_cases + js_cases + rt_cases + fail_cases
+    all_cases = [c if len(c) == 5 else (*c, None)
+                 for c in py_cases + js_cases + rt_cases + fail_cases + r4_cases]
     fail = 0
     work = tempfile.mkdtemp()
     try:
-        for name, before, after, js in all_cases:
-            g, r, gt_lost = run_case(work, name, before, after, js)
+        for name, before, after, js, cmd in all_cases:
+            g, r, gt_lost = run_case(work, name, before, after, js, cmd)
             got_lost = lost_of(g.stdout)
             got_kinds = kinds_of(g.stdout)
             replay_same = r is not None and (r.returncode, r.stdout) == (g.returncode, g.stdout)
@@ -388,13 +492,16 @@ def main():
                 if g.returncode == 2:
                     print("   " + g.stdout.strip().splitlines()[-1][:160])
                 continue
-            want = EXPECT.get(name) or EXPECT_RT.get(name)
+            want = EXPECT.get(name) or EXPECT_RT.get(name) or EXPECT_R4.get(name)
             if want is None:
                 print(f"::error::case {name} has no EXPECT row")
                 fail = 1
                 continue
-            want_rc, want_kinds, want_lost, note = want
+            want_rc, want_kinds, want_lost, note = want[:4]
+            must_say = want[4] if len(want) > 4 else ""
             problems = []
+            if must_say and must_say not in g.stdout:
+                problems.append(f"output does not say {must_say!r}")
             if g.returncode != want_rc:
                 problems.append(f"exit {g.returncode}, want {want_rc}")
             if got_kinds != sorted(want_kinds):

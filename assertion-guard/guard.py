@@ -834,19 +834,24 @@ def skip_targets_new_test(fd: FileDiff, hunk: list[Line], idx: int, removed_name
     return target.kind == "+" and t is not None and t[1] not in removed_names
 
 
-def detect(fds: list[FileDiff], static_deletions: bool = True) -> list[Finding]:
+def detect(fds: list[FileDiff], static_langs: set[str] | None = None) -> list[Finding]:
     """The findings for one diff. Reads the diff only, never the repository tree, so git
     mode and --diff-file mode decide identically on the same diff.
 
-    static_deletions=False when the runner's own collection diff decides test-deleted
-    (collect-command): then none of the static deletion rules below report anything."""
+    static_langs: the languages ("py", "js") whose deleted tests are judged by the static
+    rules below. None means every language (no collect command). With a collect command it
+    is the languages the runner reported no test ID for, so a Python runner never switches
+    off deletion checks for TS/JS tests (review round four, F2)."""
     findings: list[Finding] = []
     tests = [fd for fd in fds if not fd.binary and in_scope(fd)]
+
+    def static_for(path: str | None) -> bool:
+        return static_langs is None or language(path or "") in static_langs
 
     # ---- a test file renamed to where the runner no longer collects it ----------------
     # `git mv tests/test_calc.py attic/calc_checks.py` keeps every line and runs none of
     # them (review finding F2). Reported as a deletion; the file is not analysed further.
-    for fd in [fd for fd in tests if static_deletions
+    for fd in [fd for fd in tests if static_for(fd.old_path)
                and fd.old_path and fd.new_path and fd.old_path != fd.new_path
                and is_collected(fd.old_path) and not is_collected(fd.new_path)]:
         tests.remove(fd)
@@ -1088,8 +1093,8 @@ def detect(fds: list[FileDiff], static_deletions: bool = True) -> list[Finding]:
                     f"`{marker.strip()}` was added, which {what}.",
                 ))
 
-    # Static deletion rules: only when no runner collection diff is available.
-    if static_deletions:
+    # Static deletion rules: for every language the runner did not decide.
+    if static_langs is None or static_langs:
         # ---- 4. test-deleted: the collection invariant --------------------------------------
         # Excusal (a): only a deleted CODE file excuses, never docs/security.md (round two R7).
         deleted_code_stems = {
@@ -1104,7 +1109,8 @@ def detect(fds: list[FileDiff], static_deletions: bool = True) -> list[Finding]:
 
         lost_by_file: dict[str, list[TestBlock]] = {}
         for rb in removed_tests:
-            if status[id(rb.line)][0] == "gone" and not excused(rb.fd.old_path or rb.fd.path):
+            if (status[id(rb.line)][0] == "gone" and static_for(rb.fd.old_path or rb.fd.path)
+                    and not excused(rb.fd.old_path or rb.fd.path)):
                 lost_by_file.setdefault(rb.fd.old_path or rb.fd.path, []).append(rb)
         for fd in tests:
             lost = lost_by_file.get(fd.old_path or fd.path, [])
@@ -1131,7 +1137,7 @@ def detect(fds: list[FileDiff], static_deletions: bool = True) -> list[Finding]:
             if (m := PY_TEST_CLASS.match(ln.text))
         }
         for fd in tests:
-            if language(fd.path) != "py":
+            if language(fd.path) != "py" or not static_for(fd.path):
                 continue
             for hunk in fd.hunks:
                 for removed, added in change_blocks(hunk):
@@ -1237,28 +1243,51 @@ def coverage_findings(configs: list[FileDiff], fds: list[FileDiff]) -> list[Find
 # No excusals: a renamed, moved or consolidated test is a lost ID plus a new ID. Both are
 # listed, the run is red, and a human reads it. Those false positives are accepted.
 
-COLLECT_OK = (0, 5)  # pytest exits 5 when it collected nothing: an empty set, not an error
+COLLECT_OK = (0, 5)  # pytest exits 5 when it collected nothing; the checks below judge that
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-PYTEST_ID = re.compile(r"^[^\s:]+::\S")
-JS_LIST_ID = re.compile(r"^(?:\[[^\]]+\]\s+)?\S+\.[cm]?[jt]sx?\s+>\s+\S")
-COLLECTED_N = re.compile(r"\b(\d+)\s+tests?\s+collected\b|\bcollected\s+(\d+)\s+items?\b")
+# A pytest node ID: a path (spaces allowed, no colon), `::`, then the item. Report lines
+# such as "ERROR tests/x.py::t - boom" are not IDs. Review round four, F3: a path with a
+# space (`tests/my dir/test_b.py::t`) used to be dropped silently.
+PYTEST_ID = re.compile(
+    r"^(?!(?:ERROR|FAILED|SKIPPED|XFAIL|XPASS|PASSED|WARNING|INTERNALERROR)\b)[^\s:][^:]*::\S"
+)
+# A `vitest list` line: optional `[project]`, a test file path (spaces allowed), ` > `.
+JS_LIST_ID = re.compile(r"^(?:\[[^\]]+\]\s+)?\S.*?\.[cm]?[jt]sx?\s+>\s+\S")
+# pytest -q's own count: "7 tests collected", "2/7 tests collected (5 deselected)",
+# "no tests collected (7 deselected)", "1 test collected".
+PYTEST_COUNT = re.compile(r"(?:^|\s)(?:(\d+)(?:/\d+)?\s+tests?|no\s+tests)\s+collected\b", re.M)
+# Variables that change what a runner collects. PYTEST_ADDOPTS is unset for collection
+# (review round four, F5); the rest are named in the summary so a reader can see them.
+COLLECT_ENV_UNSET = ("PYTEST_ADDOPTS",)
+COLLECT_ENV_PREFIXES = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "VITEST_")
+LANG_NAME = {"py": "Python", "js": "TS/JS"}
 
 
 class CollectionError(RuntimeError):
-    """The runner could not collect: exit 2, with its own error tail. Never a fallback."""
+    """The runner could not collect, or what it printed cannot be trusted: exit 2, with
+    its own error tail. Never a fallback."""
 
 
-def parse_collected(output: str) -> set[str]:
-    """Test IDs from `pytest --collect-only -q` (node IDs, parametrize IDs included) or
-    `vitest list` (`file > suite > test`). One ID per line; everything else is ignored."""
-    ids: set[str] = set()
+def parse_collected_list(output: str) -> list[str]:
+    """Every test ID line, duplicates kept: vitest prints one line per test, so two tests
+    with the same name print the same line twice, and deleting one must still count."""
+    out: list[str] = []
     for raw in output.splitlines():
         line = ANSI.sub("", raw).rstrip()
         if not line or line[0].isspace():
             continue
         if PYTEST_ID.match(line) or JS_LIST_ID.match(line):
-            ids.add(line)
-    return ids
+            out.append(line)
+    return out
+
+
+def parse_collected(output: str) -> set[str]:
+    return set(parse_collected_list(output))
+
+
+def id_lang(test_id: str) -> str:
+    """Which runner a test ID came from: pytest node IDs are Python, list lines TS/JS."""
+    return "py" if PYTEST_ID.match(test_id) else "js"
 
 
 def id_path(test_id: str) -> str:
@@ -1267,8 +1296,54 @@ def id_path(test_id: str) -> str:
     return re.split(r"::|\s+>\s+", t, maxsplit=1)[0]
 
 
-def run_collect(command: str, cwd: str, label: str) -> set[str]:
+def check_collected(stdout: str, out: str, ids: list[str], label: str) -> None:
+    """Refuse output that does not add up (review round four, F1 and F3). The runner's own
+    count must match the IDs read, and a run that deselected everything is not a clean
+    empty one."""
+    text = ANSI.sub("", out)
+    py = [t for t in ids if id_lang(t) == "py"]
+    js = [t for t in ids if id_lang(t) == "js"]
+    counts = PYTEST_COUNT.findall(text)
+    if py or counts:
+        if not counts:
+            raise CollectionError(
+                f"collection at {label}: {len(py)} pytest test IDs read but no 'N tests "
+                "collected' line: the output is incomplete (cut, or a reporter turned off); "
+                "use `pytest --collect-only -q`")
+        reported = sum(int(n) for n in counts if n)
+        if reported != len(py):
+            raise CollectionError(
+                f"collection at {label}: pytest reported {reported} tests collected but "
+                f"{len(py)} test IDs could be read" + (
+                    ": no test ID could be read; use `pytest --collect-only -q`" if not py else ""))
+    if js and not py and not counts:
+        lines = [ln for ln in (ANSI.sub("", r).strip() for r in stdout.splitlines()) if ln]
+        if len(lines) != len(js):
+            raise CollectionError(
+                f"collection at {label}: vitest printed {len(lines)} lines but {len(js)} are "
+                "test IDs; use plain `vitest list` (not --json or --filesOnly)")
+
+
+def collection_env() -> list[str]:
+    """Collection-affecting variables in this environment, for the summary."""
+    out = []
+    for k in sorted(os.environ):
+        if k.startswith(COLLECT_ENV_PREFIXES):
+            note = " (ignored for collection)" if k in COLLECT_ENV_UNSET else ""
+            out.append(f"{k}={os.environ[k][:80]}{note}")
+    return out
+
+
+class Collected(list):
+    """The IDs one end reported, plus whether its runner said it deselected tests."""
+
+    deselected = False
+
+
+def run_collect(command: str, cwd: str, label: str) -> "Collected":
     env = dict(os.environ, NO_COLOR="1", FORCE_COLOR="0", PYTHONDONTWRITEBYTECODE="1")
+    for k in COLLECT_ENV_UNSET:
+        env.pop(k, None)
     try:
         p = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True,
                            errors="replace", env=env, timeout=1800)
@@ -1278,17 +1353,13 @@ def run_collect(command: str, cwd: str, label: str) -> set[str]:
     if p.returncode not in COLLECT_OK:
         tail = "\n".join(ANSI.sub("", out).strip().splitlines()[-15:])
         raise CollectionError(f"collection at {label} failed (exit {p.returncode}):\n{tail}")
-    ids = parse_collected(p.stdout)
-    m = COLLECTED_N.search(ANSI.sub("", out))
-    if not ids and m and int(m.group(1) or m.group(2)) > 0:
-        raise CollectionError(
-            f"collection at {label} reported {m.group(0)!r} but no test ID could be read: "
-            "use `pytest --collect-only -q` or `vitest list`"
-        )
+    ids = Collected(parse_collected_list(p.stdout))
+    check_collected(p.stdout, out, ids, label)
+    ids.deselected = bool(re.search(r"\bdeselected\b", ANSI.sub("", out)))
     return ids
 
 
-def collect_at(rev: str, command: str, root: str, label: str) -> set[str]:
+def collect_at(rev: str, command: str, root: str, label: str) -> "Collected":
     """Check out `rev` in a throwaway worktree and run the collect command there, in the
     caller's environment (the head's installed dependencies)."""
     wt = os.path.join(root, label)
@@ -1304,9 +1375,43 @@ def collect_at(rev: str, command: str, root: str, label: str) -> set[str]:
         subprocess.run(["git", "worktree", "remove", "--force", wt], capture_output=True)
 
 
-def collection_findings(base_ids: set[str], head_ids: set[str]) -> tuple[list[Finding], list[str]]:
-    lost = sorted(base_ids - head_ids)
-    added = sorted(head_ids - base_ids)
+def tree_test_langs(rev: str) -> set[str]:
+    """Languages with at least one file default discovery collects, at `rev`."""
+    p = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise CollectionError(f"could not list the files at {rev}: {p.stderr.strip()[:200]}")
+    return {language(f) for f in p.stdout.splitlines() if is_collected(f)}
+
+
+def check_coverage(base: list[str], head: list[str], base_rev: str, head_rev: str) -> None:
+    """Zero IDs must mean zero tests (review round four, F1). When the runner reported no
+    test at EITHER end while either tree holds files it would collect, the collect command
+    is not collecting (`-k nomatch`, `-m slow`, `-qq`, `true`, `vitest list nosuchdir`,
+    `--json`): exit 2, never "checked by the runner". This PR's own first run (no test
+    files at the merge base) stays green.
+
+    Zero at ONE end is a real answer and is reported, not refused: a PR that hides every
+    test (a class without the Test prefix, collect_ignore, deselecting everything in its
+    own config) collects them at the base and none at the head, which is every ID lost."""
+    if base or head:
+        return
+    if getattr(base, "deselected", False) or getattr(head, "deselected", False):
+        raise CollectionError(
+            "every test was deselected at both ends (-k, -m or --deselect in the collect "
+            "command or the config), so the runner reported no test to compare")
+    for rev, label in ((base_rev, "the merge base"), (head_rev, "the head")):
+        langs = tree_test_langs(rev)
+        if langs:
+            raise CollectionError(
+                f"the runner reported no test at either end, but {label} has "
+                f"{'/'.join(sorted(LANG_NAME[x] for x in langs))} test files: the collect "
+                "command collects nothing (a filter, a wrong path, a reporter turned off, "
+                "or a command that is not a collector)")
+
+
+def collection_findings(base_ids: list[str], head_ids: list[str]) -> tuple[list[Finding], list[str]]:
+    lost = sorted((Counter(base_ids) - Counter(head_ids)).elements())
+    added = sorted((Counter(head_ids) - Counter(base_ids)).elements())
     findings = [Finding(
         "test-deleted", id_path(t), 1,
         f"`{t}` was collected by the test runner before this change and is not collected "
@@ -1315,12 +1420,12 @@ def collection_findings(base_ids: set[str], head_ids: set[str]) -> tuple[list[Fi
     return findings, added
 
 
-def read_ids(path: str) -> set[str]:
+def read_ids(path: str) -> list[str]:
     with open(path, encoding="utf-8", errors="replace") as fh:
-        return {ln.rstrip("\n") for ln in fh if ln.strip()}
+        return [ln.rstrip("\n") for ln in fh if ln.strip()]
 
 
-def write_ids(directory: str, base_ids: set[str], head_ids: set[str]) -> None:
+def write_ids(directory: str, base_ids: list[str], head_ids: list[str]) -> None:
     os.makedirs(directory, exist_ok=True)
     for name, ids in (("base.ids", base_ids), ("head.ids", head_ids)):
         with open(os.path.join(directory, name), "w", encoding="utf-8") as fh:
@@ -1341,6 +1446,9 @@ JS_COLLECT_KEY = re.compile(
     r"(?:^|[\s{,])[\"']?(include|exclude|testMatch|testPathIgnorePatterns|testRegex|roots)[\"']?\s*[:=]"
 )
 JEST_PKG_KEY = re.compile(r"\"(testMatch|testPathIgnorePatterns|testRegex|roots)\"\s*:")
+# A workflow that changes how the guard itself collects (review round four, F4).
+WORKFLOW_FILE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
+WORKFLOW_GUARD_KEY = re.compile(r"collect-command|collect-setup|assertion-guard")
 
 
 def collection_config_findings(fds: list[FileDiff]) -> list[Finding]:
@@ -1358,6 +1466,8 @@ def collection_config_findings(fds: list[FileDiff]) -> list[Finding]:
             hit = lambda t: JS_COLLECT_KEY.search(code_part(t, "js"))  # noqa: E731
         elif base == "package.json":
             hit = lambda t: JEST_PKG_KEY.search(t)  # noqa: E731
+        elif WORKFLOW_FILE.match(fd.path):
+            hit = lambda t: WORKFLOW_GUARD_KEY.search(t)  # noqa: E731
         else:
             continue
         for kind in ("+", "-"):
@@ -1394,7 +1504,8 @@ STATIC_NOTE = "test deletions checked statically, not by the runner; set collect
 
 
 def verdict_line(n_findings: int, n_tests: int, n_configs: int, n_files: int,
-                 collected: tuple[set[str], set[str]] | None = None) -> str:
+                 collected: tuple[list[str], list[str]] | None = None,
+                 static_langs: set[str] | None = None) -> str:
     line = f"assertion-guard: {n_findings} finding(s) in {n_tests} test file(s) scanned"
     if n_configs:
         line += f", plus {n_configs} coverage config file(s)"
@@ -1406,16 +1517,26 @@ def verdict_line(n_findings: int, n_tests: int, n_configs: int, n_files: int,
     # read as full coverage.
     if collected is None:
         line += f"; {STATIC_NOTE}"
-    else:
-        line += (f"; test deletions checked by the runner ({len(collected[0])} collected "
-                 f"at the merge base, {len(collected[1])} at head)")
+        return line
+    covered = sorted({id_lang(t) for t in collected[0] + collected[1]})
+    names = "/".join(LANG_NAME[x] for x in covered) or "no language"
+    line += (f"; test deletions checked by the runner for {names} ({len(collected[0])} "
+             f"collected at the merge base, {len(collected[1])} at head)")
+    # Review round four, F2: a language the runner did not cover is judged statically,
+    # and the verdict says which.
+    if static_langs:
+        line += ("; statically for " + "/".join(LANG_NAME[x] for x in sorted(static_langs))
+                 + ", not by the runner")
     return line
 
 
 def write_summary(path: str, findings: list[Finding], verdict: str,
-                  collected: tuple[set[str], set[str]] | None = None,
+                  collected: tuple[list[str], list[str]] | None = None,
                   added: list[str] | None = None) -> None:
     rows = ["## assertion-guard", ""]
+    env_note = collection_env() if collected is not None else []
+    if env_note:
+        rows += ["Collection environment: " + "; ".join(f"`{_md(e)}`" for e in env_note), ""]
     if collected is None:
         rows += [f"> **Warning: {STATIC_NOTE}.** Deleted tests are judged from the diff "
                  "alone, which has missed real deletions before. This is not full coverage.", ""]
@@ -1485,7 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
                 "test file(s) arrived as binary, so their changes cannot be read: "
                 + ", ".join(unreadable[:5])
             )
-        collected: tuple[set[str], set[str]] | None = None
+        collected: tuple[list[str], list[str]] | None = None
         if args.collect_command:
             if args.diff_file:
                 raise RuntimeError("--collect-command needs git mode (--base and --head); "
@@ -1499,10 +1620,27 @@ def main(argv: list[str] | None = None) -> int:
             if mb.returncode != 0 or not mb.stdout.strip():
                 raise RuntimeError(f"no merge base for {args.base} and {args.head}: "
                                    f"{mb.stderr.strip()[:200]}")
+            merge_base = mb.stdout.strip()
             root = tempfile.mkdtemp(prefix="assertion-guard-")
             try:
-                collected = (collect_at(mb.stdout.strip(), args.collect_command, root, "base"),
-                             collect_at(args.head, args.collect_command, root, "head"))
+                base_error: CollectionError | None = None
+                try:
+                    base_ids = collect_at(merge_base, args.collect_command, root, "base")
+                except CollectionError as exc:
+                    base_error = exc
+                try:
+                    head_ids = collect_at(args.head, args.collect_command, root, "head")
+                except CollectionError as exc:
+                    if base_error is not None:
+                        raise CollectionError(f"{exc}\n(the merge base failed to collect too)") from None
+                    raise
+                if base_error is not None:
+                    # Only the base failed: the head collects, the merge base does not.
+                    raise CollectionError(
+                        "a dependency change broke collection at the merge base; a human must "
+                        f"merge this.\n{base_error}")
+                check_coverage(base_ids, head_ids, merge_base, args.head)
+                collected = (base_ids, head_ids)
             finally:
                 shutil.rmtree(root, ignore_errors=True)
             if args.ids_out:
@@ -1511,7 +1649,16 @@ def main(argv: list[str] | None = None) -> int:
             if not (args.base_ids and args.head_ids):
                 raise RuntimeError("pass both --base-ids and --head-ids")
             collected = (read_ids(args.base_ids), read_ids(args.head_ids))
-        findings = detect(fds, static_deletions=collected is None)
+        # The runner decides deletions for every language it reported IDs for; any other
+        # language keeps the static deletion rules (review round four, F2: a Python
+        # collect command must not switch off deletion checks for vitest tests).
+        static_langs: set[str] | None = None
+        if collected is not None:
+            covered = {id_lang(t) for t in collected[0] + collected[1]}
+            in_diff = {language(fd.old_path or fd.path) for fd in fds
+                       if not fd.binary and in_scope(fd)} - {None}
+            static_langs = in_diff - covered
+        findings = detect(fds, static_langs=static_langs)
         added: list[str] = []
         if collected is not None:
             lost_findings, added = collection_findings(*collected)
@@ -1529,7 +1676,12 @@ def main(argv: list[str] | None = None) -> int:
 
     n_tests = sum(1 for fd in fds if not fd.binary and in_scope(fd))
     n_cfg = sum(1 for fd in fds if not fd.binary and is_coverage_config(fd.path))
-    verdict = verdict_line(len(findings), n_tests, n_cfg, len(fds), collected)
+    verdict = verdict_line(len(findings), n_tests, n_cfg, len(fds), collected,
+                           static_langs if collected is not None else None)
+    if collected is not None:
+        env_note = collection_env()
+        if env_note:
+            print("collection environment: " + "; ".join(env_note))
 
     for f in findings:
         print(f"{f.kind}\t{f.path}:{f.line}\t{f.message}")
