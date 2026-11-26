@@ -1,0 +1,60 @@
+name: assertion-guard
+description: >-
+  Fail a pull request that makes its tests easier to pass: assertions lost on net, an
+  exact check loosened, a skip or .only added, a test deleted while its code stays, or a
+  coverage floor lowered. Reads only test files and coverage config. Python standard
+  library only; installs nothing and needs no token.
+
+# WHY THIS EXISTS
+#   An agent asked to make a red suite green has two ways to do it: fix the code, or make
+#   the tests ask for less. CI cannot tell those apart, because both end green. This guard
+#   reads the diff of the tests themselves and goes red on the second kind, so the
+#   reviewer has to read and explain it. There is deliberately no override label or
+#   keyword: a red guard is meant to be read, not silenced.
+#
+# WHAT IT WILL NOT CATCH
+#   A test that was always too weak, and tests in languages other than Python and
+#   TypeScript/JavaScript (Go and Kotlin are not read yet).
+
+inputs:
+  base:
+    description: >-
+      Base commit of the diff. Defaults to the pull_request event's base SHA. The diff is
+      `git diff <base>...<head>`, the same three-dot form a pull request shows.
+    required: false
+    default: ''
+  head:
+    description: Head commit of the diff. Defaults to the pull_request event's head SHA.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Make both ends of the diff and their merge base available
+      shell: bash
+      env:
+        BASE: ${{ inputs.base || github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
+      run: |
+        set -uo pipefail
+        if [ -z "$BASE" ] || [ -z "$HEAD_SHA" ]; then
+          echo "assertion-guard: ERROR: no base or head commit. Run on pull_request, or pass both inputs."
+          exit 2
+        fi
+        # actions/checkout is shallow by default, and a three-dot diff needs the merge
+        # base. Fetch both ends, and deepen only if the merge base is still missing.
+        git fetch --no-tags --quiet origin "$BASE" "$HEAD_SHA" 2>/dev/null || true
+        if ! git merge-base "$BASE" "$HEAD_SHA" >/dev/null 2>&1; then
+          git fetch --no-tags --quiet --unshallow origin 2>/dev/null \
+            || git fetch --no-tags --quiet origin 2>/dev/null || true
+        fi
+        # No verdict is reached here: if the history is still unusable, guard.py's own
+        # `git diff` fails and it prints an ERROR line and exits 2, never a clean pass.
+
+    - name: Read the test changes
+      shell: bash
+      env:
+        GUARD_BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
+        GUARD_HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
+      run: python3 -B "${GITHUB_ACTION_PATH}/guard.py"

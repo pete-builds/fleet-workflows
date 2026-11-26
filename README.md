@@ -93,6 +93,53 @@ header-derived command, same pinned uv. That agreement being structural (both re
 lock's own header and compile fresh) rather than remembered is the point of sharing the
 implementation.
 
+## assertion-guard (composite action)
+
+Goes red when a pull request makes its tests easier to pass. An agent told to turn a red
+suite green can fix the code or make the tests ask for less, and CI cannot tell those
+apart. This reads the diff of the tests themselves (Python, and TypeScript/JavaScript)
+plus the config files that hold coverage floors, and reports:
+
+| Finding | Meaning |
+|---|---|
+| `net-assertion-loss` | a test file that still exists loses more assertions than it gains |
+| `loosened-assertion` | an exact check became a weaker one: `==` to `is not None`, `toEqual` to `toBeDefined`, a specific error to `Exception`, a wider `approx` tolerance, fewer `toBeCloseTo` digits |
+| `skip-added` | a skip or xfail on an existing test, or a `.only` anywhere |
+| `test-deleted` | a test removed and not re-added anywhere in the diff (renames, moves and parametrize consolidations are matched), or a whole test file deleted while its subject remains |
+| `coverage-floor-lowered` | `fail_under`, `--cov-fail-under` or a vitest/jest threshold lowered or removed |
+
+Each finding is an `::error` annotation on the line, a row in the step summary, and exit 1.
+The last line is always a verdict, including when no test file changed:
+`assertion-guard: N finding(s) in M test file(s) scanned`. A run that could not read the
+diff prints `assertion-guard: ERROR: ...` and exits 2, never a clean pass. There is no
+override label or keyword: a red guard is meant to be read by the reviewer, who merges past
+it only with a written reason.
+
+Caller usage (the whole per-repo file):
+
+```yaml
+name: assertion-guard
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pete-builds/fleet-workflows/assertion-guard@<FULL_COMMIT_SHA> # vX.Y.Z
+```
+
+Offline replay of any diff: `gh pr diff 123 > pr.diff && python3 assertion-guard/guard.py --diff-file pr.diff`.
+
+Controls, on every push and pull request (`smoke.yml`): the unit tests, a planted
+`smoke/assertion-guard/weakened.diff` that must produce exactly the findings in
+`weakened.expected`, a `clean-refactor.diff` (a test renamed and moved, assertions added,
+reformatting) that must produce none, and the action itself run end to end on a planted
+commit pair that must fail. `smoke/assertion-guard/build-fixtures.sh` regenerates both
+fixtures from real git history.
+
 ## Releasing a change
 
 1. Edit the action.

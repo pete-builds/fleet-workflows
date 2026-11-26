@@ -11,19 +11,84 @@ name: smoke
 #
 # `uses: ./lockfile-recompile` tests HEAD of this repo, so run this BEFORE tagging a
 # release, and pin callers only to tags whose smoke passed.
+#
+# The three lockfile jobs open real PRs, so they run on manual dispatch ONLY. The
+# assertion-guard controls write nothing and run on every push and pull request.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: write
   pull-requests: write
 
+# Dispatch runs keep the one shared group they always had (they push the
+# lockfile-recompile branch). Push and PR runs only read, so each ref gets its own group
+# and never queues behind, or cancels, a dispatch.
 concurrency:
-  group: lockfile-recompile
+  group: ${{ github.event_name == 'workflow_dispatch' && 'lockfile-recompile' || format('smoke-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
+  # PERMANENT CONTROLS for assertion-guard, both directions, on every change:
+  #   unit tests (each rule caught AND its legitimate neighbour left alone), then the two
+  #   fixtures: weakened.diff must fail with exactly weakened.expected, and
+  #   clean-refactor.diff (rename, move, added assertions, reformatting) must pass.
+  assertion-guard-controls:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests
+        run: python3 -B assertion-guard/test_guard.py
+      - name: Fixtures (weakened must fail exactly, clean refactor must pass)
+        run: bash smoke/assertion-guard/check.sh
+
+  # The composite action end to end, in git mode, as a caller runs it. The fixtures above
+  # prove the rules; this proves action.yml wires them: it must FAIL on a commit pair
+  # that deletes a test, then PASS on this pull request itself.
+  assertion-guard-action:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Plant two local commits, the second deleting a test
+        run: |
+          set -euo pipefail
+          git config user.name ctl
+          git config user.email ctl@example.invalid
+          echo "ctl_orig=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p ctl-planted/tests
+          printf 'def test_kept():\n    assert 1 == 1\n\n\ndef test_dropped():\n    assert 2 == 2\n' \
+            > ctl-planted/tests/test_ctl.py
+          git add ctl-planted && git commit -qm "ctl: two tests"
+          echo "ctl_base=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          printf 'def test_kept():\n    assert 1 == 1\n' > ctl-planted/tests/test_ctl.py
+          git commit -qam "ctl: drop one"
+          echo "ctl_head=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: The action on the planted pair (must fail)
+        id: must_fail
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base }}
+          head: ${{ env.ctl_head }}
+      - name: Require the failure
+        if: steps.must_fail.outcome != 'failure'
+        run: |
+          echo "::error::assertion-guard passed a commit that deletes a test: it can never say no"
+          exit 1
+      - name: Back to the checkout this run started from
+        run: git checkout -q "$ctl_orig"
+      - name: The action on this pull request (must pass unless the PR weakens a test)
+        uses: ./assertion-guard
+
   # BOTH DIRECTIONS, in one job, against the same stale fixture:
   #   1. the drift check MUST FAIL on the stale lock (a check that cannot say no is not
   #      a check), and
@@ -31,6 +96,7 @@ jobs:
   #      that cannot say yes is not a check either; a redaction pass that matches
   #      nothing looks exactly like a clean one).
   drift-check:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -53,6 +119,7 @@ jobs:
           uv-version: '0.12.5'
 
   smoke:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -90,6 +157,7 @@ jobs:
   #
   # This job reproduces the recurring case. It fails on the pre-fix action.
   rerun-over-an-existing-branch:
+    if: github.event_name == 'workflow_dispatch'
     needs: smoke
     runs-on: ubuntu-latest
     permissions:

@@ -1,0 +1,136 @@
+diff --git a/.coveragerc b/.coveragerc
+new file mode 100644
+index 0000000..4672b3b
+--- /dev/null
++++ b/.coveragerc
+@@ -0,0 +1,2 @@
++[report]
++fail_under = 90
+diff --git a/pyproject.toml b/pyproject.toml
+index 3e92603..3207fdc 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,3 @@
+ [project]
+ name = "fixture"
+ version = "0.0.0"
+-
+-[tool.coverage.report]
+-fail_under = 90
+diff --git a/src/arith.test.ts b/src/arith.test.ts
+new file mode 100644
+index 0000000..8b31648
+--- /dev/null
++++ b/src/arith.test.ts
+@@ -0,0 +1,7 @@
++import { expect, it } from 'vitest';
++import { add } from './math';
++
++it('adds two numbers', () => {
++  expect(add(1, 2)).toBe(3);
++  expect(add(2, 2)).toBe(4);
++});
+diff --git a/src/math.test.ts b/src/math.test.ts
+index a8ae39e..69c423c 100644
+--- a/src/math.test.ts
++++ b/src/math.test.ts
+@@ -1,11 +1,7 @@
+ import { describe, expect, it } from 'vitest';
+-import { add, third } from './math';
++import { third } from './math';
+ 
+ describe('math', () => {
+-  it('adds', () => {
+-    expect(add(1, 2)).toBe(3);
+-  });
+-
+   it('computes a third', () => {
+     expect(third()).toBeCloseTo(0.3333, 4);
+   });
+diff --git a/tests/test_arith.py b/tests/test_arith.py
+new file mode 100644
+index 0000000..bb93777
+--- /dev/null
++++ b/tests/test_arith.py
+@@ -0,0 +1,10 @@
++from src.calc import add
++
++
++def test_addition():
++    assert add(1, 2) == 3
++    assert add(-1, 1) == 0
++
++
++def test_multiply_table():
++    assert add(2, 2) == 4
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+index 3bd7cac..b79bdee 100644
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -1,20 +1,22 @@
+-import pytest
+-
+-from src.calc import add, divide, subtract
++import os
+ 
++import pytest
+ 
+-def test_add():
+-    assert add(1, 2) == 3
+-    assert add(-1, 1) == 0
++from src.calc import divide, subtract
+ 
+ 
+ def test_subtract():
+     assert subtract(5, 3) == 2
++    assert subtract(3, 5) == -2
+ 
+ 
+ def test_divide():
+-    assert divide(6, 3) == 2
++    assert (
++        divide(6, 3)
++        == 2
++    )
+     assert divide(1, 3) == pytest.approx(0.3333, rel=1e-4)
++    assert divide(0, 3) == 0
+ 
+ 
+ def test_divide_by_zero():
+@@ -22,5 +24,6 @@ def test_divide_by_zero():
+         divide(1, 0)
+ 
+ 
+-def test_multiply_table():
+-    assert add(2, 2) == 4
++@pytest.mark.skipif(os.name == "nt", reason="POSIX only")
++def test_divide_posix_floats():
++    assert divide(1.0, 4.0) == 0.25
+diff --git a/tests/test_parse.py b/tests/test_parse.py
+index 0d71245..c2ad63d 100644
+--- a/tests/test_parse.py
++++ b/tests/test_parse.py
+@@ -1,9 +1,19 @@
++import pytest
++
+ from src.parse import parse
+ 
+ 
+-def test_parse_int():
+-    assert parse("000042") == 42
++@pytest.mark.parametrize(
++    ("text", "expected"),
++    [
++        ("000042", 42),
++        ("-00001", -1),
++    ],
++)
++def test_parse_values(text, expected):
++    assert parse(text) == expected
+ 
+ 
+-def test_parse_negative():
+-    assert parse("-00001") == -1
++def test_parse_reports_one_value():
++    (value,) = [parse("7")]
++    assert value == 7
