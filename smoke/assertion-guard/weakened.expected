@@ -1,0 +1,14 @@
+# Exactly the findings weakened.diff must produce: <type><TAB><file>:<line>.
+# Every one was planted on purpose by build-fixtures.sh. Twelve findings, all five types.
+coverage-floor-lowered	pyproject.toml:6
+skip-added	src/math.test.ts:5
+loosened-assertion	src/math.test.ts:6
+loosened-assertion	src/math.test.ts:10
+net-assertion-loss	tests/test_calc.py:8
+test-deleted	tests/test_calc.py:8
+loosened-assertion	tests/test_calc.py:11
+loosened-assertion	tests/test_calc.py:12
+loosened-assertion	tests/test_calc.py:16
+skip-added	tests/test_calc.py:20
+test-deleted	tests/test_parse.py:1
+coverage-floor-lowered	vitest.config.ts:7

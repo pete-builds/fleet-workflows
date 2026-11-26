@@ -11,27 +11,193 @@ name: smoke
 #
 # `uses: ./lockfile-recompile` tests HEAD of this repo, so run this BEFORE tagging a
 # release, and pin callers only to tags whose smoke passed.
+#
+# `smoke` and `rerun-over-an-existing-branch` push a branch and open a real PR, so they run
+# on manual dispatch ONLY. `drift-check` and the assertion-guard controls write nothing
+# and run on every push and pull request.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: write
   pull-requests: write
 
+# Dispatch runs keep the one shared group they always had (they push the
+# lockfile-recompile branch). Push and PR runs only read, so each ref gets its own group
+# and never queues behind, or cancels, a dispatch.
 concurrency:
-  group: lockfile-recompile
+  group: ${{ github.event_name == 'workflow_dispatch' && 'lockfile-recompile' || format('smoke-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
+  # PERMANENT CONTROLS for assertion-guard, both directions, on every change:
+  #   unit tests (each rule caught AND its legitimate neighbour left alone), then the two
+  #   fixtures: weakened.diff must fail with exactly weakened.expected, and
+  #   clean-refactor.diff (rename, move, added assertions, reformatting) must pass.
+  assertion-guard-controls:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests
+        run: python3 -B assertion-guard/test_guard.py
+      - name: Fixtures (weakened must fail exactly, clean refactor must pass)
+        run: bash smoke/assertion-guard/check.sh
+      # The collection diff against the REAL runners, pinned: pytest 9.2.0 from a
+      # hash-checked lock, vitest 3.2.4 from its package-lock. A missing runner is a FAIL.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install the pinned runners
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/runner-py"
+          "$RUNNER_TEMP/runner-py/bin/pip" install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.txt
+          npm ci --prefix smoke/assertion-guard/runner-js --ignore-scripts --no-audit --no-fund
+      - name: Collection-diff fixtures (every round-three hole red, judged by the runner)
+        env:
+          RUNNER_PYTHON: ${{ runner.temp }}/runner-py/bin/python
+        run: python3 -B smoke/assertion-guard/runner_cases.py
+
+  # The composite action end to end, in git mode, as a caller runs it. The fixtures above
+  # prove the rules; this proves action.yml wires them. Each planted pair must end with
+  # exit code 1 AND a test-deleted finding: "any failure" would also accept exit 2, a guard
+  # that could not read the diff at all. Then the action must PASS on this pull request.
+  assertion-guard-action:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Plant commit pairs that each delete a test
+        run: |
+          set -euo pipefail
+          git config user.name ctl
+          git config user.email ctl@example.invalid
+          echo "ctl_orig=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          # Pair 1: one test removed from a file that stays.
+          mkdir -p ctl-planted/tests
+          printf 'def test_kept():\n    assert keep() == 1\n\n\ndef test_dropped():\n    assert drop() == 2\n' \
+            > ctl-planted/tests/test_ctl.py
+          git add ctl-planted && git commit -qm "ctl: two tests"
+          echo "ctl_base=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          printf 'def test_kept():\n    assert keep() == 1\n' > ctl-planted/tests/test_ctl.py
+          git commit -qam "ctl: drop one"
+          echo "ctl_head=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          # Pair 2 (review finding F1): a whole test file named for a feature, not a
+          # module, deleted while the code it tests stays. Git mode once excused this.
+          mkdir -p ctl-planted/src/app
+          printf 'def login(u, p):\n    return u == "a" and p == "b"\n' > ctl-planted/src/app/auth.py
+          printf 'def test_rejects_bad_password():\n    assert login("a", "x") is False\n' \
+            > ctl-planted/tests/test_security.py
+          git add ctl-planted && git commit -qm "ctl: feature-named test file"
+          echo "ctl_base2=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git rm -q ctl-planted/tests/test_security.py && git commit -qm "ctl: delete it"
+          echo "ctl_head2=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: The action on pair 1, a test removed (must fail with exit 1)
+        id: pair1
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base }}
+          head: ${{ env.ctl_head }}
+      - name: The action on pair 2, a feature-named test file deleted (must fail with exit 1)
+        id: pair2
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base2 }}
+          head: ${{ env.ctl_head2 }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: The action on pair 1 again, with the runner deciding (must fail with exit 1)
+        id: pair3
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base }}
+          head: ${{ env.ctl_head }}
+          collect-setup: python -m pip install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.txt
+          collect-command: python -m pytest --collect-only -q -p no:cacheprovider ctl-planted
+      - name: Require exit 1 and test-deleted from all three
+        env:
+          P3_OUTCOME: ${{ steps.pair3.outcome }}
+          P3_EXIT: ${{ steps.pair3.outputs.exit-code }}
+          P3_KINDS: ${{ steps.pair3.outputs.kinds }}
+          P3_VERDICT: ${{ steps.pair3.outputs.verdict }}
+          P1_OUTCOME: ${{ steps.pair1.outcome }}
+          P1_EXIT: ${{ steps.pair1.outputs.exit-code }}
+          P1_KINDS: ${{ steps.pair1.outputs.kinds }}
+          P2_OUTCOME: ${{ steps.pair2.outcome }}
+          P2_EXIT: ${{ steps.pair2.outputs.exit-code }}
+          P2_KINDS: ${{ steps.pair2.outputs.kinds }}
+        run: |
+          set -u
+          bad=0
+          for p in 1 2 3; do
+            outcome_var="P${p}_OUTCOME"; exit_var="P${p}_EXIT"; kinds_var="P${p}_KINDS"
+            outcome="${!outcome_var}"; code="${!exit_var}"; kinds="${!kinds_var}"
+            if [ "$outcome" != failure ] || [ "$code" != 1 ]; then
+              echo "::error::pair $p: outcome '$outcome', exit '$code'; want failure with exit 1"; bad=1
+            fi
+            case ",$kinds," in
+              *,test-deleted,*) ;;
+              *) echo "::error::pair $p: findings '$kinds' do not include test-deleted"; bad=1 ;;
+            esac
+          done
+          case "$P3_VERDICT" in
+            *"test deletions checked by the runner"*) ;;
+            *) echo "::error::pair 3 verdict does not say the runner decided: $P3_VERDICT"; bad=1 ;;
+          esac
+          if [ "$bad" -ne 0 ]; then echo "assertion-guard action controls: FAIL"; exit 1; fi
+          echo "assertion-guard action controls: PASS (pair 1 exit $P1_EXIT [$P1_KINDS], pair 2 exit $P2_EXIT [$P2_KINDS], pair 3 by the runner exit $P3_EXIT [$P3_KINDS])"
+      - name: Back to the checkout this run started from
+        run: git checkout -q "$ctl_orig"
+      - name: The action on this pull request, the runner deciding deletions
+        id: self
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          collect-command: python -m pytest --collect-only -q -p no:cacheprovider
+      # Green, or red ONLY because the PR edits this workflow's own guard setup (which the
+      # guard rightly names as collection-config-changed). Any other finding, a lost test
+      # above all, or an exit 2, fails here.
+      - name: Require this pull request to pass the guard
+        env:
+          EXIT: ${{ steps.self.outputs.exit-code }}
+          KINDS: ${{ steps.self.outputs.kinds }}
+          VERDICT: ${{ steps.self.outputs.verdict }}
+        run: |
+          set -u
+          if [ "$EXIT" = 0 ] || { [ "$EXIT" = 1 ] && [ "$KINDS" = collection-config-changed ]; }; then
+            echo "this pull request: PASS (exit $EXIT [$KINDS]) $VERDICT"
+          else
+            echo "::error::this pull request: exit $EXIT [$KINDS]; want 0, or 1 with only collection-config-changed"
+            exit 1
+          fi
+
   # BOTH DIRECTIONS, in one job, against the same stale fixture:
   #   1. the drift check MUST FAIL on the stale lock (a check that cannot say no is not
   #      a check), and
   #   2. after fixing the lock in the working tree, the SAME check MUST PASS (a check
   #      that cannot say yes is not a check either; a redaction pass that matches
   #      nothing looks exactly like a clean one).
+  #
+  # Read only (it opens nothing and pushes nothing), so it runs on every push and PR.
   drift-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - name: Drift check against the stale control lock (must fail)
@@ -53,6 +219,7 @@ jobs:
           uv-version: '0.12.5'
 
   smoke:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -90,6 +257,7 @@ jobs:
   #
   # This job reproduces the recurring case. It fails on the pre-fix action.
   rerun-over-an-existing-branch:
+    if: github.event_name == 'workflow_dispatch'
     needs: smoke
     runs-on: ubuntu-latest
     permissions:

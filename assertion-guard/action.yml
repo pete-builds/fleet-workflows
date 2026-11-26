@@ -1,0 +1,121 @@
+name: assertion-guard
+description: >-
+  Fail a pull request that makes its tests easier to pass: a test the runner collected
+  before and does not collect after (with collect-command), assertions lost on net, an
+  exact check loosened, a skip or .only added, collection config changed, or a coverage
+  floor lowered. The guard is Python standard library only and needs no token.
+
+# WHY THIS EXISTS
+#   An agent asked to make a red suite green has two ways to do it: fix the code, or make
+#   the tests ask for less. CI cannot tell those apart, because both end green. This guard
+#   reads the diff of the tests themselves and goes red on the second kind, so the
+#   reviewer has to read and explain it. There is deliberately no override label or
+#   keyword: a red guard is meant to be read, not silenced.
+#
+# WHAT IT WILL NOT CATCH
+#   A test that was always too weak, and tests in languages other than Python and
+#   TypeScript/JavaScript (Go and Kotlin are not read yet).
+
+inputs:
+  base:
+    description: >-
+      Base commit of the diff. Defaults to the pull_request event's base SHA. The diff is
+      `git diff <base>...<head>`, the same three-dot form a pull request shows.
+    required: false
+    default: ''
+  head:
+    description: Head commit of the diff. Defaults to the pull_request event's head SHA.
+    required: false
+    default: ''
+  collect-command:
+    description: >-
+      The test runner's collect command, run at the BASE commit and at the HEAD commit,
+      each in its own git worktree, in this job's environment. Use the command your CI
+      runs, with the same config: `python -m pytest --collect-only -q` or `npx vitest
+      list`. Every test ID collected at the base and not at the head is reported as
+      test-deleted. If collection fails at either end, the guard exits 2 with the runner's
+      error. Empty means test deletions are judged statically from the diff, and the
+      verdict says so.
+    required: false
+    default: ''
+  collect-setup:
+    description: >-
+      Optional shell command run once before collecting, in the checked-out head, to
+      install dependencies (for example `pip install -r requirements-dev.lock` or `npm ci`).
+      Both collections use what it installs.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Make both ends of the diff and their merge base available
+      shell: bash
+      env:
+        BASE: ${{ inputs.base || github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
+      run: |
+        set -uo pipefail
+        if [ -z "$BASE" ] || [ -z "$HEAD_SHA" ]; then
+          echo "assertion-guard: ERROR: no base or head commit. Run on pull_request, or pass both inputs."
+          exit 2
+        fi
+        # actions/checkout is shallow by default, and a three-dot diff needs the merge
+        # base. Fetch both ends, and deepen only if the merge base is still missing.
+        git fetch --no-tags --quiet origin "$BASE" "$HEAD_SHA" 2>/dev/null || true
+        if ! git merge-base "$BASE" "$HEAD_SHA" >/dev/null 2>&1; then
+          git fetch --no-tags --quiet --unshallow origin 2>/dev/null \
+            || git fetch --no-tags --quiet origin 2>/dev/null || true
+        fi
+        # No verdict is reached here: if the history is still unusable, guard.py's own
+        # `git diff` fails and it prints an ERROR line and exits 2, never a clean pass.
+
+    - name: Install what the collect command needs
+      if: inputs.collect-setup != ''
+      shell: bash
+      env:
+        SETUP: ${{ inputs.collect-setup }}
+      run: bash -c "$SETUP"
+
+    # Runs the guard without failing, so its outputs are always published; the next step
+    # fails with the guard's own exit code (1 findings, 2 no verdict).
+    - name: Read the test changes
+      id: guard
+      shell: bash
+      env:
+        GUARD_BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
+        GUARD_HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
+        GUARD_COLLECT_COMMAND: ${{ inputs.collect-command }}
+      run: |
+        set +e
+        log="$(mktemp)"
+        python3 -B "${GITHUB_ACTION_PATH}/guard.py" | tee "$log"
+        status="${PIPESTATUS[0]}"
+        set -e
+        {
+          echo "exit-code=$status"
+          echo "verdict=$(tail -n 1 "$log")"
+          echo "kinds=$(awk -F'\t' 'NF >= 3 { print $1 }' "$log" | sort -u | paste -sd, -)"
+        } >> "$GITHUB_OUTPUT"
+        rm -f "$log"
+
+    - name: Fail unless the guard passed
+      if: steps.guard.outputs.exit-code != '0'
+      shell: bash
+      env:
+        STATUS: ${{ steps.guard.outputs.exit-code }}
+        VERDICT: ${{ steps.guard.outputs.verdict }}
+      run: |
+        echo "$VERDICT"
+        exit "${STATUS:-2}"
+
+outputs:
+  exit-code:
+    description: The guard's exit code. 0 no findings, 1 findings, 2 no verdict.
+    value: ${{ steps.guard.outputs.exit-code }}
+  verdict:
+    description: The guard's final verdict line.
+    value: ${{ steps.guard.outputs.verdict }}
+  kinds:
+    description: Comma-separated finding types reported (empty when none).
+    value: ${{ steps.guard.outputs.kinds }}

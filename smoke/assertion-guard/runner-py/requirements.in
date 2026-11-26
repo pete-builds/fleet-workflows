@@ -1,0 +1,5 @@
+# The real runner for the assertion-guard collection-diff fixtures. Exact pin.
+# Compiled to requirements.txt (hash-pinned), deliberately NOT *.lock: the repo's
+# lockfile drift check and recompile loop rebuild every tracked *.lock from the repo
+# root, and this fixture pin is not a project dependency.
+pytest==9.2.0

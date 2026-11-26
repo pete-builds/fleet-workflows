@@ -1,0 +1,8 @@
+{
+  "name": "assertion-guard-runner-fixture",
+  "private": true,
+  "description": "Pinned vitest for the assertion-guard collection-diff fixtures. Not a published package.",
+  "devDependencies": {
+    "vitest": "3.2.4"
+  }
+}
