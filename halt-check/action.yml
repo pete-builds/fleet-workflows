@@ -40,7 +40,15 @@ runs:
     - name: Read the fleet halt switch
       id: check
       shell: bash
-      run: bash "${GITHUB_ACTION_PATH}/gha-step.sh" "The calling job stops here."
+      env:
+        FAIL_UNLESS_CLEAR: ${{ inputs.fail-unless-clear }}
+      run: |
+        if [ "$FAIL_UNLESS_CLEAR" = "false" ]; then
+          consequence="Reported only (fail-unless-clear is false): the calling job decides."
+        else
+          consequence="The calling job stops here."
+        fi
+        bash "${GITHUB_ACTION_PATH}/gha-step.sh" "$consequence"
 
     - name: Stop unless clear
       if: inputs.fail-unless-clear != 'false' && steps.check.outputs.state != 'clear'

@@ -40,7 +40,7 @@ if [ "$state" = clear ]; then
 fi
 
 msg="$line"
-[ -z "$consequence" ] || msg="$line. $consequence"
+[ -z "$consequence" ] || msg="${line%.}. $consequence"
 echo "::notice title=fleet halt switch::$(printf '%s' "$msg" | sed 's/%/%25/g')"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   # shellcheck disable=SC2016  # the backticks are literal Markdown, not a command
