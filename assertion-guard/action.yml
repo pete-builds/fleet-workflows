@@ -1,9 +1,9 @@
 name: assertion-guard
 description: >-
-  Fail a pull request that makes its tests easier to pass: assertions lost on net, an
-  exact check loosened, a skip or .only added, a test deleted while its code stays, or a
-  coverage floor lowered. Reads only test files and coverage config. Python standard
-  library only; installs nothing and needs no token.
+  Fail a pull request that makes its tests easier to pass: a test the runner collected
+  before and does not collect after (with collect-command), assertions lost on net, an
+  exact check loosened, a skip or .only added, collection config changed, or a coverage
+  floor lowered. The guard is Python standard library only and needs no token.
 
 # WHY THIS EXISTS
 #   An agent asked to make a red suite green has two ways to do it: fix the code, or make
@@ -25,6 +25,24 @@ inputs:
     default: ''
   head:
     description: Head commit of the diff. Defaults to the pull_request event's head SHA.
+    required: false
+    default: ''
+  collect-command:
+    description: >-
+      The test runner's collect command, run at the BASE commit and at the HEAD commit,
+      each in its own git worktree, in this job's environment. Use the command your CI
+      runs, with the same config: `python -m pytest --collect-only -q` or `npx vitest
+      list`. Every test ID collected at the base and not at the head is reported as
+      test-deleted. If collection fails at either end, the guard exits 2 with the runner's
+      error. Empty means test deletions are judged statically from the diff, and the
+      verdict says so.
+    required: false
+    default: ''
+  collect-setup:
+    description: >-
+      Optional shell command run once before collecting, in the checked-out head, to
+      install dependencies (for example `pip install -r requirements-dev.lock` or `npm ci`).
+      Both collections use what it installs.
     required: false
     default: ''
 
@@ -52,6 +70,13 @@ runs:
         # No verdict is reached here: if the history is still unusable, guard.py's own
         # `git diff` fails and it prints an ERROR line and exits 2, never a clean pass.
 
+    - name: Install what the collect command needs
+      if: inputs.collect-setup != ''
+      shell: bash
+      env:
+        SETUP: ${{ inputs.collect-setup }}
+      run: bash -c "$SETUP"
+
     # Runs the guard without failing, so its outputs are always published; the next step
     # fails with the guard's own exit code (1 findings, 2 no verdict).
     - name: Read the test changes
@@ -60,6 +85,7 @@ runs:
       env:
         GUARD_BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
         GUARD_HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
+        GUARD_COLLECT_COMMAND: ${{ inputs.collect-command }}
       run: |
         set +e
         log="$(mktemp)"

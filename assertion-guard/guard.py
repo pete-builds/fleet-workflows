@@ -5,15 +5,18 @@ Reads a unified diff (``git diff <base>...<head>``, or ``--diff-file`` for offli
 replay) and looks ONLY at test files and at config files that carry coverage floors.
 Python standard library only, so a caller installs nothing.
 
-Five finding types, each reported with a file, a line and one plain sentence:
+Six finding types, each reported with a file, a line and one plain sentence:
 
   net-assertion-loss      a test file that still exists loses more assertions than it gains
   loosened-assertion      an exact check replaced by a weaker one in the same change, or
                           an added check over constants only, which cannot fail
   skip-added              a skip, xfail or .only was added
-  test-deleted            a test the runner collected at the base is no longer collected
-                          at the head (THE COLLECTION INVARIANT, stated in full above
-                          classify_removed_tests and in the README)
+  test-deleted            a test the runner collected before this change and does not
+                          collect after it. With --collect-command the runner is asked
+                          at the base and the head and every lost ID is reported, no
+                          excusals; without it, a static fallback model (the verdict says
+                          so)
+  collection-config-changed  a changed line that changes which tests the runner collects
 
 Git mode and --diff-file mode read the same diff and decide identically: the guard never
 consults the repository tree.
@@ -33,8 +36,10 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -708,6 +713,10 @@ def looks_like_rename(old: TestBlock, new: TestBlock) -> bool:
 # STOPPING RULE (set before round three): if another high is found in this mechanism,
 # rename and move excusal is removed entirely. Any collected test name that disappears
 # is reported as test-deleted, false positives accepted, and the reviewer reads them.
+#
+# ROUND THREE APPLIED IT. This static model is now only the FALLBACK, used when no
+# collect command is given, and the verdict line says so. With a collect command the
+# runner itself decides test-deleted, with no excusals at all: see "The collection diff".
 # ======================================================================================
 
 
@@ -825,16 +834,20 @@ def skip_targets_new_test(fd: FileDiff, hunk: list[Line], idx: int, removed_name
     return target.kind == "+" and t is not None and t[1] not in removed_names
 
 
-def detect(fds: list[FileDiff]) -> list[Finding]:
+def detect(fds: list[FileDiff], static_deletions: bool = True) -> list[Finding]:
     """The findings for one diff. Reads the diff only, never the repository tree, so git
-    mode and --diff-file mode decide identically on the same diff."""
+    mode and --diff-file mode decide identically on the same diff.
+
+    static_deletions=False when the runner's own collection diff decides test-deleted
+    (collect-command): then none of the static deletion rules below report anything."""
     findings: list[Finding] = []
     tests = [fd for fd in fds if not fd.binary and in_scope(fd)]
 
     # ---- a test file renamed to where the runner no longer collects it ----------------
     # `git mv tests/test_calc.py attic/calc_checks.py` keeps every line and runs none of
     # them (review finding F2). Reported as a deletion; the file is not analysed further.
-    for fd in [fd for fd in tests if fd.old_path and fd.new_path and fd.old_path != fd.new_path
+    for fd in [fd for fd in tests if static_deletions
+               and fd.old_path and fd.new_path and fd.old_path != fd.new_path
                and is_collected(fd.old_path) and not is_collected(fd.new_path)]:
         tests.remove(fd)
         findings.append(Finding(
@@ -1075,64 +1088,67 @@ def detect(fds: list[FileDiff]) -> list[Finding]:
                     f"`{marker.strip()}` was added, which {what}.",
                 ))
 
-    # ---- 4. test-deleted: the collection invariant --------------------------------------
-    # Excusal (a): only a deleted CODE file excuses, never docs/security.md (round two R7).
-    deleted_code_stems = {
-        fd.old_path.split("/")[-1].rsplit(".", 1)[0]
-        for fd in fds if fd.deleted and fd.old_path and language(fd.old_path)
-        and not is_test_file(fd.old_path)
-    }
+    # Static deletion rules: only when no runner collection diff is available.
+    if static_deletions:
+        # ---- 4. test-deleted: the collection invariant --------------------------------------
+        # Excusal (a): only a deleted CODE file excuses, never docs/security.md (round two R7).
+        deleted_code_stems = {
+            fd.old_path.split("/")[-1].rsplit(".", 1)[0]
+            for fd in fds if fd.deleted and fd.old_path and language(fd.old_path)
+            and not is_test_file(fd.old_path)
+        }
 
-    def excused(path: str) -> bool:
-        stem = subject_stem(path)
-        return stem is not None and stem in deleted_code_stems
+        def excused(path: str) -> bool:
+            stem = subject_stem(path)
+            return stem is not None and stem in deleted_code_stems
 
-    lost_by_file: dict[str, list[TestBlock]] = {}
-    for rb in removed_tests:
-        if status[id(rb.line)][0] == "gone" and not excused(rb.fd.old_path or rb.fd.path):
-            lost_by_file.setdefault(rb.fd.old_path or rb.fd.path, []).append(rb)
-    for fd in tests:
-        lost = lost_by_file.get(fd.old_path or fd.path, [])
-        if not lost:
-            continue
-        if fd.deleted:
-            findings.append(Finding(
-                "test-deleted", fd.old_path or fd.path, 1,
-                f"This whole test file was deleted ({len(lost)} test(s) not re-added in any "
-                f"file the runner collects) while the code it tests is still there.",
-            ))
-            continue
-        for rb in lost:
-            findings.append(Finding(
-                "test-deleted", fd.path, max(1, rb.line.new_no),
-                f"The test `{rb.name}` was removed and is not re-added in any file the "
-                f"test runner collects.",
-            ))
+        lost_by_file: dict[str, list[TestBlock]] = {}
+        for rb in removed_tests:
+            if status[id(rb.line)][0] == "gone" and not excused(rb.fd.old_path or rb.fd.path):
+                lost_by_file.setdefault(rb.fd.old_path or rb.fd.path, []).append(rb)
+        for fd in tests:
+            lost = lost_by_file.get(fd.old_path or fd.path, [])
+            if not lost:
+                continue
+            if fd.deleted:
+                findings.append(Finding(
+                    "test-deleted", fd.old_path or fd.path, 1,
+                    f"This whole test file was deleted ({len(lost)} test(s) not re-added in any "
+                    f"file the runner collects) while the code it tests is still there.",
+                ))
+                continue
+            for rb in lost:
+                findings.append(Finding(
+                    "test-deleted", fd.path, max(1, rb.line.new_no),
+                    f"The test `{rb.name}` was removed and is not re-added in any file the "
+                    f"test runner collects.",
+                ))
 
-    # A `class Test*` renamed to a name pytest does not collect: every method in it stops
-    # running while the diff shows one changed line.
-    readded_classes = {
-        m.group(1) for fd in tests if language(fd.path) == "py" for ln in fd.lines("+")
-        if (m := PY_TEST_CLASS.match(ln.text))
-    }
-    for fd in tests:
-        if language(fd.path) != "py":
-            continue
-        for hunk in fd.hunks:
-            for removed, added in change_blocks(hunk):
-                old = [m.group(1) for ln in removed if (m := PY_TEST_CLASS.match(ln.text))]
-                new = [(ln, m.group(1)) for ln in added
-                       if (m := PY_ANY_CLASS.match(ln.text)) and not m.group(1).startswith("Test")
-                       and "TestCase" not in ln.text]
-                for name, (ln, to) in zip([n for n in old if n not in readded_classes], new):
-                    findings.append(Finding(
-                        "test-deleted", fd.path, ln.new_no,
-                        f"The test class {name} was renamed to {to}, which pytest does not "
-                        f"collect, so every test in it stops running.",
-                    ))
+        # A `class Test*` renamed to a name pytest does not collect: every method in it stops
+        # running while the diff shows one changed line.
+        readded_classes = {
+            m.group(1) for fd in tests if language(fd.path) == "py" for ln in fd.lines("+")
+            if (m := PY_TEST_CLASS.match(ln.text))
+        }
+        for fd in tests:
+            if language(fd.path) != "py":
+                continue
+            for hunk in fd.hunks:
+                for removed, added in change_blocks(hunk):
+                    old = [m.group(1) for ln in removed if (m := PY_TEST_CLASS.match(ln.text))]
+                    new = [(ln, m.group(1)) for ln in added
+                           if (m := PY_ANY_CLASS.match(ln.text)) and not m.group(1).startswith("Test")
+                           and "TestCase" not in ln.text]
+                    for name, (ln, to) in zip([n for n in old if n not in readded_classes], new):
+                        findings.append(Finding(
+                            "test-deleted", fd.path, ln.new_no,
+                            f"The test class {name} was renamed to {to}, which pytest does not "
+                            f"collect, so every test in it stops running.",
+                        ))
 
     # ---- 5. coverage-floor-lowered ---------------------------------------------------
     findings.extend(coverage_findings(configs, fds))
+    findings.extend(collection_config_findings(fds))
 
     findings.sort(key=lambda f: (f.path, f.line, f.kind))
     return findings
@@ -1205,6 +1221,159 @@ def coverage_findings(configs: list[FileDiff], fds: list[FileDiff]) -> list[Find
 
 
 # --------------------------------------------------------------------------------------
+# The collection diff: ask the runner, do not model it
+# --------------------------------------------------------------------------------------
+#
+# THE RULE: a test the runner collected before this PR and does not collect after it is
+# reported. Nothing else decides test-deleted when a collect command is set.
+#
+# Why the runner and not a model of it: three review rounds each found the static model of
+# "what pytest or vitest collects" wrong in a new way (a test moved into conftest.py, into
+# a class without the Test prefix, under `if False:`, under tests/build/, outside
+# testpaths; a parametrize row dropped; vitest not collecting helpers under test/). The
+# runner is the only authority on what it runs, so the guard runs it, at the base and at
+# the head, and diffs the IDs it reports.
+#
+# No excusals: a renamed, moved or consolidated test is a lost ID plus a new ID. Both are
+# listed, the run is red, and a human reads it. Those false positives are accepted.
+
+COLLECT_OK = (0, 5)  # pytest exits 5 when it collected nothing: an empty set, not an error
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+PYTEST_ID = re.compile(r"^[^\s:]+::\S")
+JS_LIST_ID = re.compile(r"^(?:\[[^\]]+\]\s+)?\S+\.[cm]?[jt]sx?\s+>\s+\S")
+COLLECTED_N = re.compile(r"\b(\d+)\s+tests?\s+collected\b|\bcollected\s+(\d+)\s+items?\b")
+
+
+class CollectionError(RuntimeError):
+    """The runner could not collect: exit 2, with its own error tail. Never a fallback."""
+
+
+def parse_collected(output: str) -> set[str]:
+    """Test IDs from `pytest --collect-only -q` (node IDs, parametrize IDs included) or
+    `vitest list` (`file > suite > test`). One ID per line; everything else is ignored."""
+    ids: set[str] = set()
+    for raw in output.splitlines():
+        line = ANSI.sub("", raw).rstrip()
+        if not line or line[0].isspace():
+            continue
+        if PYTEST_ID.match(line) or JS_LIST_ID.match(line):
+            ids.add(line)
+    return ids
+
+
+def id_path(test_id: str) -> str:
+    """The file part of a test ID, for the annotation."""
+    t = re.sub(r"^\[[^\]]+\]\s+", "", test_id)
+    return re.split(r"::|\s+>\s+", t, maxsplit=1)[0]
+
+
+def run_collect(command: str, cwd: str, label: str) -> set[str]:
+    env = dict(os.environ, NO_COLOR="1", FORCE_COLOR="0", PYTHONDONTWRITEBYTECODE="1")
+    try:
+        p = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True,
+                           errors="replace", env=env, timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise CollectionError(f"collection at {label} timed out after 30 minutes") from None
+    out = p.stdout + ("\n" + p.stderr if p.stderr.strip() else "")
+    if p.returncode not in COLLECT_OK:
+        tail = "\n".join(ANSI.sub("", out).strip().splitlines()[-15:])
+        raise CollectionError(f"collection at {label} failed (exit {p.returncode}):\n{tail}")
+    ids = parse_collected(p.stdout)
+    m = COLLECTED_N.search(ANSI.sub("", out))
+    if not ids and m and int(m.group(1) or m.group(2)) > 0:
+        raise CollectionError(
+            f"collection at {label} reported {m.group(0)!r} but no test ID could be read: "
+            "use `pytest --collect-only -q` or `vitest list`"
+        )
+    return ids
+
+
+def collect_at(rev: str, command: str, root: str, label: str) -> set[str]:
+    """Check out `rev` in a throwaway worktree and run the collect command there, in the
+    caller's environment (the head's installed dependencies)."""
+    wt = os.path.join(root, label)
+    p = subprocess.run(["git", "worktree", "add", "--detach", "--force", wt, rev],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise CollectionError(f"could not check out {label} ({rev}): {p.stderr.strip()[:300]}")
+    try:
+        if os.path.isdir("node_modules") and not os.path.exists(os.path.join(wt, "node_modules")):
+            os.symlink(os.path.abspath("node_modules"), os.path.join(wt, "node_modules"))
+        return run_collect(command, wt, label)
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", wt], capture_output=True)
+
+
+def collection_findings(base_ids: set[str], head_ids: set[str]) -> tuple[list[Finding], list[str]]:
+    lost = sorted(base_ids - head_ids)
+    added = sorted(head_ids - base_ids)
+    findings = [Finding(
+        "test-deleted", id_path(t), 1,
+        f"`{t}` was collected by the test runner before this change and is not collected "
+        f"after it.",
+    ) for t in lost]
+    return findings, added
+
+
+def read_ids(path: str) -> set[str]:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return {ln.rstrip("\n") for ln in fh if ln.strip()}
+
+
+def write_ids(directory: str, base_ids: set[str], head_ids: set[str]) -> None:
+    os.makedirs(directory, exist_ok=True)
+    for name, ids in (("base.ids", base_ids), ("head.ids", head_ids)):
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as fh:
+            fh.writelines(t + "\n" for t in sorted(ids))
+
+
+# --------------------------------------------------------------------------------------
+# collection-config-changed: names the cause the collection diff shows the effect of
+# --------------------------------------------------------------------------------------
+
+PY_COLLECT_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"}
+PY_COLLECT_KEY = re.compile(
+    r"^\s*\[?(testpaths|python_files|python_classes|python_functions|norecursedirs)\b\s*[=\]]"
+)
+PY_COLLECT_FLAG = re.compile(r"--ignore\b|--ignore-glob\b|--deselect\b|(?:^|[\s\"'\[,])-k(?:[\s\"'=,\]]|$)")
+CONFTEST_IGNORE = re.compile(r"\bcollect_ignore(_glob)?\b")
+JS_COLLECT_KEY = re.compile(
+    r"(?:^|[\s{,])[\"']?(include|exclude|testMatch|testPathIgnorePatterns|testRegex|roots)[\"']?\s*[:=]"
+)
+JEST_PKG_KEY = re.compile(r"\"(testMatch|testPathIgnorePatterns|testRegex|roots)\"\s*:")
+
+
+def collection_config_findings(fds: list[FileDiff]) -> list[Finding]:
+    """Any changed line that can change which tests the runner collects."""
+    out: list[Finding] = []
+    for fd in fds:
+        if fd.binary:
+            continue
+        base = fd.path.split("/")[-1]
+        if base in PY_COLLECT_CONFIG:
+            hit = lambda t: PY_COLLECT_KEY.search(t) or PY_COLLECT_FLAG.search(t)  # noqa: E731
+        elif base == "conftest.py":
+            hit = lambda t: CONFTEST_IGNORE.search(code_part(t, "py"))  # noqa: E731
+        elif COVERAGE_CONFIG_RE.match(base):
+            hit = lambda t: JS_COLLECT_KEY.search(code_part(t, "js"))  # noqa: E731
+        elif base == "package.json":
+            hit = lambda t: JEST_PKG_KEY.search(t)  # noqa: E731
+        else:
+            continue
+        for kind in ("+", "-"):
+            for ln in fd.lines(kind):
+                if hit(ln.text):
+                    verb = "added" if kind == "+" else "removed"
+                    out.append(Finding(
+                        "collection-config-changed", fd.path, max(1, ln.new_no),
+                        f"`{ln.text.strip()[:80]}` was {verb}: it changes which tests the "
+                        f"runner collects. The collection diff shows the effect; this names "
+                        f"the cause.",
+                    ))
+    return out
+
+
+# --------------------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------------------
 
@@ -1221,19 +1390,35 @@ def _md(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ")
 
 
-def verdict_line(n_findings: int, n_tests: int, n_configs: int, n_files: int) -> str:
+STATIC_NOTE = "test deletions checked statically, not by the runner; set collect-command"
+
+
+def verdict_line(n_findings: int, n_tests: int, n_configs: int, n_files: int,
+                 collected: tuple[set[str], set[str]] | None = None) -> str:
     line = f"assertion-guard: {n_findings} finding(s) in {n_tests} test file(s) scanned"
     if n_configs:
         line += f", plus {n_configs} coverage config file(s)"
     if n_files == 0:
         line += " (the diff is empty: no files changed at all)"
     elif n_tests == 0:
-        line += " (no test files changed in this diff, so no test could have been weakened)"
+        line += " (no test files changed in this diff)"
+    # The deletion check's coverage is part of the verdict, so a static run can never
+    # read as full coverage.
+    if collected is None:
+        line += f"; {STATIC_NOTE}"
+    else:
+        line += (f"; test deletions checked by the runner ({len(collected[0])} collected "
+                 f"at the merge base, {len(collected[1])} at head)")
     return line
 
 
-def write_summary(path: str, findings: list[Finding], verdict: str) -> None:
+def write_summary(path: str, findings: list[Finding], verdict: str,
+                  collected: tuple[set[str], set[str]] | None = None,
+                  added: list[str] | None = None) -> None:
     rows = ["## assertion-guard", ""]
+    if collected is None:
+        rows += [f"> **Warning: {STATIC_NOTE}.** Deleted tests are judged from the diff "
+                 "alone, which has missed real deletions before. This is not full coverage.", ""]
     if findings:
         rows += [
             "A red guard means this change makes at least one test easier to pass. "
@@ -1245,6 +1430,9 @@ def write_summary(path: str, findings: list[Finding], verdict: str) -> None:
         rows += [f"| `{f.kind}` | `{_md(f.path)}` | {f.line} | {_md(f.message)} |" for f in findings]
     else:
         rows.append("No weakened tests found.")
+    if added:
+        rows += ["", "**Test IDs this change adds (renamed or consolidated? A human reads "
+                 "this):**", ""] + [f"- `{_md(t)}`" for t in added]
     rows += ["", f"`{verdict}`", ""]
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(rows) + "\n")
@@ -1269,6 +1457,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--head", default=os.environ.get("GUARD_HEAD_SHA", ""))
     ap.add_argument("--summary-file", default=os.environ.get("GITHUB_STEP_SUMMARY", ""))
     ap.add_argument("--no-annotations", action="store_true")
+    ap.add_argument("--collect-command", default=os.environ.get("GUARD_COLLECT_COMMAND", ""),
+                    help="the runner's collect command, e.g. 'python -m pytest --collect-only -q'; "
+                         "run at the base and the head (git mode only)")
+    ap.add_argument("--base-ids", help="replay: test IDs collected at the base, one per line")
+    ap.add_argument("--head-ids", help="replay: test IDs collected at the head, one per line")
+    ap.add_argument("--ids-out", help="git mode with a collect command: write base.ids and head.ids here")
     args = ap.parse_args(argv)
 
     try:
@@ -1291,7 +1485,41 @@ def main(argv: list[str] | None = None) -> int:
                 "test file(s) arrived as binary, so their changes cannot be read: "
                 + ", ".join(unreadable[:5])
             )
-        findings = detect(fds)
+        collected: tuple[set[str], set[str]] | None = None
+        if args.collect_command:
+            if args.diff_file:
+                raise RuntimeError("--collect-command needs git mode (--base and --head); "
+                                   "to replay, pass --base-ids and --head-ids")
+            # Collect at the MERGE BASE, the same point the three-dot diff measures from.
+            # The base tip is wrong when the branch is behind: every test main gained after
+            # the branch point would read as lost (calibration: mcp-unifi#231 and #232
+            # "lost" 32 tests that #230 had just added to main).
+            mb = subprocess.run(["git", "merge-base", args.base, args.head],
+                                capture_output=True, text=True)
+            if mb.returncode != 0 or not mb.stdout.strip():
+                raise RuntimeError(f"no merge base for {args.base} and {args.head}: "
+                                   f"{mb.stderr.strip()[:200]}")
+            root = tempfile.mkdtemp(prefix="assertion-guard-")
+            try:
+                collected = (collect_at(mb.stdout.strip(), args.collect_command, root, "base"),
+                             collect_at(args.head, args.collect_command, root, "head"))
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+            if args.ids_out:
+                write_ids(args.ids_out, *collected)
+        elif args.base_ids or args.head_ids:
+            if not (args.base_ids and args.head_ids):
+                raise RuntimeError("pass both --base-ids and --head-ids")
+            collected = (read_ids(args.base_ids), read_ids(args.head_ids))
+        findings = detect(fds, static_deletions=collected is None)
+        added: list[str] = []
+        if collected is not None:
+            lost_findings, added = collection_findings(*collected)
+            findings = sorted(findings + lost_findings, key=lambda f: (f.path, f.line, f.kind))
+    except CollectionError as exc:
+        print(f"assertion-guard: ERROR: {exc}".replace("\n", "\n  "))
+        print("assertion-guard: ERROR: the test runner could not collect, so no verdict")
+        return 2
     except (OSError, RuntimeError) as exc:
         print(f"assertion-guard: ERROR: {exc}")
         return 2
@@ -1301,7 +1529,7 @@ def main(argv: list[str] | None = None) -> int:
 
     n_tests = sum(1 for fd in fds if not fd.binary and in_scope(fd))
     n_cfg = sum(1 for fd in fds if not fd.binary and is_coverage_config(fd.path))
-    verdict = verdict_line(len(findings), n_tests, n_cfg, len(fds))
+    verdict = verdict_line(len(findings), n_tests, n_cfg, len(fds), collected)
 
     for f in findings:
         print(f"{f.kind}\t{f.path}:{f.line}\t{f.message}")
@@ -1310,9 +1538,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"::error file={_esc_prop(f.path)},line={f.line},"
                 f"title={_esc_prop('assertion-guard ' + f.kind)}::{_esc_data(f.message)}"
             )
+    if added:
+        lost_n = sum(1 for f in findings if f.kind == "test-deleted")
+        head = "renamed or consolidated? A human reads this" if lost_n else "new tests"
+        print(f"test IDs added by this change ({head}):")
+        for t in added:
+            print(f"  + {t}")
     if args.summary_file:
         try:
-            write_summary(args.summary_file, findings, verdict)
+            write_summary(args.summary_file, findings, verdict, collected, added)
         except OSError as exc:
             print(f"assertion-guard: warning: could not write step summary: {exc}")
     print(verdict)

@@ -97,45 +97,59 @@ implementation.
 
 Goes red when a pull request makes its tests easier to pass. An agent told to turn a red
 suite green can fix the code or make the tests ask for less, and CI cannot tell those
-apart. This reads the diff of the tests themselves (Python, and TypeScript/JavaScript)
-plus the config files that hold coverage floors, and reports:
+apart. The guard has two halves.
+
+**Deleted tests: the runner decides.** The rule is one sentence:
+
+> A test the runner collected before this PR and does not collect after it is reported.
+
+Set `collect-command` to the collect command your CI's runner uses, with the same config.
+The action checks out the merge base (the same point the pull request's diff starts from,
+so tests main gained after the branch point are not counted) and the head in separate
+worktrees, runs the command in each, diffs the test IDs the runner prints (pytest node IDs, parametrize IDs included;
+`vitest list` lines), and reports every ID present at the base and missing at the head
+as `test-deleted`, with the full ID. If collection fails at either end, the guard exits 2
+with the runner's own error, never a quiet fallback.
+
+**There are no excusals.** A renamed, moved or consolidated test shows up as a lost ID
+plus a new one. Both are listed in the summary under "renamed or consolidated? A human
+reads this", and the run is still red. That is deliberate: three review rounds each found
+the guard's own model of "what the runner collects" wrong in a new way (tests moved into
+`conftest.py`, into a class without the `Test` prefix, under `if False:`, under
+`tests/build/`, outside `testpaths`; a parametrize row dropped; vitest skipping helpers
+under `test/`), and every excusal was a place to hide a deletion. Asking the runner
+removes the model; accepting renames as red removes the hiding places. The reviewer reads
+each rename.
+
+Without `collect-command`, deleted tests are judged statically from the diff (a removed
+`def test_*` or `it(...)` not re-added in a file that default discovery collects), and
+the verdict line itself says `test deletions checked statically, not by the runner; set
+collect-command`. That is a fallback, not full coverage.
+
+**Everything the runner cannot see is checked from the diff:**
 
 | Finding | Meaning |
 |---|---|
-| `net-assertion-loss` | a test file that still exists loses more assertions than it gains |
+| `test-deleted` | a test ID the runner collected at the base is not collected at the head (static fallback: a removed test not re-added where it is collected) |
+| `collection-config-changed` | a changed line in `testpaths`, `python_files`, `python_classes`, `python_functions`, `norecursedirs`, `addopts` with `--ignore`, `--deselect` or `-k`, `collect_ignore` in a conftest, or vitest/jest `include`, `exclude`, `testMatch`: the collection diff shows the effect, this names the cause |
+| `net-assertion-loss` | a test file that still exists loses more assertions than it gains (mock `assert_called*` and friends count) |
 | `loosened-assertion` | an exact check became a weaker one: `==` to `is not None` or `>=`, `toEqual` to `toBeDefined`, `toHaveBeenCalledWith` to `toHaveBeenCalled`, a specific error to `Exception`, `assertRaisesRegex` to `assertRaises`, `toThrow('msg')` to `toThrow()`, a wider `approx` tolerance, fewer `toBeCloseTo` digits; or an added check over constants only (`assert 3 == 3`) |
 | `skip-added` | a skip or xfail on an existing test, or a `.only` anywhere |
-| `test-deleted` | a test the runner collected at the base is no longer collected at the head (see the invariant below): removed, moved into a file the runner does not collect (`conftest.py`, a helper module), its file or `class Test*` renamed out of collection, or its file deleted |
 | `coverage-floor-lowered` | `fail_under`, `--cov-fail-under` or a vitest/jest threshold lowered or removed |
 
-**The collection invariant.** Every test that the runner would collect at the base must
-still be collected at the head, unless (a) the code file it is named for was deleted in the
-same diff, or (b) it was consolidated into a parametrized test that keeps every expected
-value. One whole-diff check enforces it: collected test identities at the base, minus
-collected test identities at the head, minus the two excusals, is reported as
-`test-deleted`. A removed test only survives through a partner (same name, a look-alike
-body, a rename in place) that sits in a file the runner collects. "Collects" means default
-discovery: `test_*.py` and `*_test.py` for pytest; `__tests__/`, `test/`, `*.test.*` and
-`*.spec.*` for JS.
+In git mode the diff is read with `--text --no-textconv`, so a `.gitattributes` line
+cannot turn test changes into "Binary files differ"; a replayed diff that shows a test file
+as binary is an error.
 
-**Stopping rule.** Two review rounds each found a high in this one mechanism (deciding
-whether a removed test survived elsewhere). If a third does, rename and move excusal is
-removed entirely: any collected test name that disappears is reported, false positives
-accepted, and the reviewer reads them.
-
-Test files are Python under `tests/` or `test/`, `test_*.py`, `*_test.py`, `conftest.py`, and
-TS/JS under `__tests__/`, `test/`, `tests/`, `*.test.*`, `*.spec.*`. In git mode the diff is
-read with `--text --no-textconv`, so a `.gitattributes` line cannot turn test changes into
-"Binary files differ"; a replayed diff that shows a test file as binary is an error.
-
-Each finding is an `::error` annotation on the line, a row in the step summary, and exit 1.
-The last line is always a verdict, including when no test file changed:
-`assertion-guard: N finding(s) in M test file(s) scanned`. A run that could not read the
-diff prints `assertion-guard: ERROR: ...` and exits 2, never a clean pass. There is no
+Each finding is an `::error` annotation, a row in the step summary, and exit 1. The last
+line is always a verdict and names how deletions were checked:
+`assertion-guard: N finding(s) in M test file(s) scanned; test deletions checked by the
+runner (B collected at the merge base, H at head)`. A run that could not read the diff, or whose
+runner could not collect, prints `assertion-guard: ERROR: ...` and exits 2. There is no
 override label or keyword: a red guard is meant to be read by the reviewer, who merges past
 it only with a written reason.
 
-Caller usage (the whole per-repo file):
+Caller usage (the whole per-repo file), for a pytest repo:
 
 ```yaml
 name: assertion-guard
@@ -148,38 +162,58 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
       - uses: pete-builds/fleet-workflows/assertion-guard@<FULL_COMMIT_SHA> # vX.Y.Z
+        with:
+          collect-setup: pip install --require-hashes -r requirements-dev.lock
+          collect-command: python -m pytest --collect-only -q -p no:cacheprovider
 ```
 
-Offline replay of any diff: `gh pr diff 123 > pr.diff && python3 assertion-guard/guard.py --diff-file pr.diff`.
+For vitest: `collect-setup: npm ci` and `collect-command: npx vitest list`. Both
+collections run with the head's installed dependencies; a test ID that only exists
+because of a dependency change is out of scope.
 
-Controls, on every push and pull request (`smoke.yml`): the unit tests, a planted
-`smoke/assertion-guard/weakened.diff` that must produce exactly the findings in
-`weakened.expected`, a `clean-refactor.diff` (a test renamed and moved, assertions added,
-reformatting) that must produce none, the independent reviewer's probes
-(`smoke/assertion-guard/probes.sh`), and the action itself run end to end on two planted
-commit pairs that must each end with exit 1 and `test-deleted`. Every fixture and probe runs
-in BOTH modes, git mode on a real repo and `--diff-file` on the same change, and the two
-must print identical results. `smoke/assertion-guard/build-fixtures.sh` regenerates the
-fixtures from real git history.
+Offline replay: `gh pr diff 123 > pr.diff && python3 assertion-guard/guard.py --diff-file
+pr.diff`, plus `--base-ids` and `--head-ids` to replay a recorded collection (git mode
+with `--ids-out DIR` writes them).
 
 The action's outputs are `exit-code` (0, 1 or 2), `verdict` and `kinds`.
 
-The second review round's cases are permanent too (`smoke/assertion-guard/cases.py`, both
-modes, exact expected results), including one case per condition of the rename rule where
-only that condition stops a deleted test passing as renamed.
+**Controls**, on every push and pull request (`smoke.yml`):
 
-**Known limits**, each pinned by a case in `cases.py` so a fix shows up as a deliberate
-change rather than drift:
+- unit tests, including the collection diff against a fake runner, so a mutation of the
+  rule fails a unit test, not only a fixture;
+- `runner_cases.py`: every round-three case (H1 to H13, J1 to J3), the earlier R and T
+  series, and a collection failure, against pytest 9.2.0 and vitest 3.2.4 pinned in
+  `smoke/assertion-guard/runner-py` and `runner-js`. Each case's lost IDs must equal what
+  the runner itself reports when the script runs it directly, and the recorded-ID replay
+  must print identically;
+- `weakened.diff` (exactly the findings in `weakened.expected`), `clean-refactor.diff`
+  (none), `probes.sh` and `cases.py` for the static half, each in git mode and
+  `--diff-file` mode with identical output required;
+- the action itself on three planted commit pairs (the third with `collect-command`),
+  each required to end with exit 1 and `test-deleted`, then on this pull request with
+  `collect-command`.
 
-- Not detected yet: `== 3` replaced by `!= 0` (G3) or by `isinstance(...)` (G4); a
-  `raise unittest.SkipTest(...)` added inside a test (M4); vitest `test.runIf(false)` (M5).
-- False positives: a test renamed while one assertion is strengthened (R3) or an expected
-  value changed (R3b) reports `test-deleted`; test source written inside a string, such
-  as a `pytester.makepyfile` body, can trip the constant-assertion rule (K2).
-- By design: an added constant assertion such as `assert True` always fires (K3).
-- Editing a test in place (or renaming it while editing one setup line) is not read as a
-  weakening unless an assertion is removed or loosened (R1, R1b).
+**Known limits**, each pinned by a case or measured in calibration:
+
+- Inserting a row into a `@pytest.mark.parametrize` list whose IDs pytest generates from
+  the row index (`args30`) renumbers every later row, so those rows read as lost and
+  re-added. Give rows explicit `ids=` to avoid it. Red, and a human reads it.
+- A dependency major (a new fastmcp, say) can leave the merge base unable to import under
+  the head's dependencies; collection then fails and the guard exits 2 rather than guess.
+- A duplicate `def test_x` that shadows an existing one keeps the ID, so the runner still
+  collects it and nothing is reported (H6b).
+- Static half, not detected yet: `== 3` replaced by `!= 0` (G3) or by `isinstance(...)`
+  (G4); `raise unittest.SkipTest(...)` added inside a test (M4); vitest `test.runIf(false)`
+  (M5).
+- Static half, false positives: test source written inside a string, such as a
+  `pytester.makepyfile` body, can trip the constant-assertion rule (K2); an added
+  constant assertion such as `assert True` always fires (K3, by design).
+- Editing a test in place is not read as a weakening unless an assertion is removed or
+  loosened.
 - Go, Rust and Kotlin tests are not read.
 
 ## Releasing a change

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -616,6 +617,180 @@ class ReviewFindingTests(unittest.TestCase):
         self.assertIn("internal failure", out[-1])
 
 
+class CollectionDiffTests(unittest.TestCase):
+    """The deletion side when a collect command is set: the runner decides, the guard diffs.
+    A fake runner (`cat COLLECT.txt`) prints the IDs each commit declares, so these cases
+    test the collection-diff invariant itself, with no excusal anywhere."""
+
+    CMD = "cat COLLECT.txt"
+
+    def run_collect(self, before, after, cmd=None, extra=()):
+        repo = Repo(before, after)
+        ids = tempfile.mkdtemp()
+        try:
+            rc, out = run_main(["--base", repo.base, "--head", repo.head, "--collect-command",
+                                cmd or self.CMD, "--ids-out", ids, "--no-annotations",
+                                "--summary-file", "", *extra], cwd=repo.dir)
+            # Replay the same change from the recorded IDs: it must print identically.
+            if rc != 2:
+                fd, path = tempfile.mkstemp(suffix=".diff")
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(repo.diff())
+                rc_r, out_r = run_main(["--diff-file", path, "--base-ids", os.path.join(ids, "base.ids"),
+                                        "--head-ids", os.path.join(ids, "head.ids"),
+                                        "--no-annotations", "--summary-file", ""])
+                os.remove(path)
+                self.assertEqual((rc_r, out_r), (rc, out), "replay from recorded IDs differs")
+            return rc, out
+        finally:
+            repo.close()
+            shutil.rmtree(ids, ignore_errors=True)
+
+    @staticmethod
+    def lost(out):
+        return sorted(ln.split("`")[1] for ln in out if ln.startswith("test-deleted\t"))
+
+    T = "def test_a():\n    assert f() == 1\n"
+
+    def test_every_lost_id_is_reported(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_a\ntests/test_a.py::test_b\n"}
+        a = {"COLLECT.txt": "tests/test_a.py::test_a\n"}
+        rc, out = self.run_collect(b, a)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.lost(out), ["tests/test_a.py::test_b"])
+        self.assertIn("test deletions checked by the runner (2 collected at the merge base, 1 at head)", out[-1])
+
+    def test_a_rename_is_red_and_both_ids_are_listed(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_old\n"}
+        a = {"tests/test_a.py": self.T.replace("test_a", "test_new"), "COLLECT.txt": "tests/test_a.py::test_new\n"}
+        rc, out = self.run_collect(b, a)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.lost(out), ["tests/test_a.py::test_old"])
+        self.assertIn("test IDs added by this change (renamed or consolidated? A human reads this):", out)
+        self.assertIn("  + tests/test_a.py::test_new", out)
+
+    def test_a_move_that_keeps_the_name_is_still_red(self):
+        # The same test name collected somewhere else is not the same test: no excusal by
+        # name, class or file (round three H6, H13). Both IDs listed, the run red.
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "tests/test_a.py::test_x\ntests/test_b.py::test_y\n"}
+        a = {"COLLECT.txt": "tests/test_b.py::test_y\ntests/test_b.py::TestMoved::test_x\n"}
+        rc, out = self.run_collect(b, a)
+        self.assertEqual((rc, self.lost(out)), (1, ["tests/test_a.py::test_x"]))
+        self.assertIn("  + tests/test_b.py::TestMoved::test_x", out)
+
+    def test_a_branch_behind_main_is_compared_from_the_merge_base(self):
+        # main gains test t3 after the branch point; the branch adds t2. Collecting at the
+        # base TIP would report t3 as lost by a PR that never touched it (mcp-unifi#231).
+        tmp = tempfile.mkdtemp()
+        try:
+            for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@example.invalid"],
+                         ["config", "user.name", "t"]):
+                git(tmp, *args)
+
+            def commit(text, msg):
+                with open(os.path.join(tmp, "COLLECT.txt"), "w") as fh:
+                    fh.write(text)
+                git(tmp, "add", "-A")
+                git(tmp, "commit", "-qm", msg)
+                return git(tmp, "rev-parse", "HEAD").strip()
+
+            commit("t.py::t1\n", "branch point")
+            git(tmp, "checkout", "-q", "-b", "pr")
+            head = commit("t.py::t1\nt.py::t2\n", "pr adds t2")
+            git(tmp, "checkout", "-q", "main")
+            base = commit("t.py::t1\nt.py::t3\n", "main adds t3 later")
+            rc, out = run_main(["--base", base, "--head", head, "--collect-command", self.CMD,
+                                "--no-annotations", "--summary-file", ""], cwd=tmp)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("(1 collected at the merge base, 2 at head)", out[-1])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_excusal_even_when_the_code_file_is_deleted(self):
+        b = {"src/calc.py": "x = 1\n", "tests/test_calc.py": self.T, "COLLECT.txt": "tests/test_calc.py::test_a\n"}
+        a = {"src/calc.py": None, "tests/test_calc.py": None, "COLLECT.txt": ""}
+        rc, out = self.run_collect(b, a)
+        self.assertEqual(self.lost(out), ["tests/test_calc.py::test_a"])
+        self.assertEqual(rc, 1)
+
+    def test_the_runner_overrules_the_static_model(self):
+        # The diff deletes a test file, but the runner still collects the same IDs (say the
+        # tests live on elsewhere): no test-deleted. And the reverse: nothing in the diff
+        # removes a test, but the runner lost one: red.
+        b = {"tests/test_a.py": self.T, "tests/test_b.py": self.T, "COLLECT.txt": "x.py::t1\n"}
+        rc, out = self.run_collect(b, {"tests/test_b.py": None})
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_collect(b, {"COLLECT.txt": ""})
+        self.assertEqual((rc, self.lost(out)), (1, ["x.py::t1"]))
+
+    def test_added_only_is_green(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
+        rc, out = self.run_collect(b, {"COLLECT.txt": "t.py::a\nt.py::b\n"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("test IDs added by this change (new tests):", out)
+
+    def test_collection_failure_is_exit_2_with_the_runner_tail(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
+        rc, out = self.run_collect(b, {"COLLECT.txt": "t.py::a\n"}, cmd="echo 'ImportError: boom' >&2; exit 4")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("ImportError: boom", "\n".join(out))
+        self.assertTrue(out[-1].startswith("assertion-guard: ERROR:"), out)
+
+    def test_pytest_exit_5_means_nothing_collected(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "t.py::a\n"}
+        rc, out = self.run_collect(b, {"COLLECT.txt": ""}, cmd="cat COLLECT.txt; test -s COLLECT.txt || exit 5")
+        self.assertEqual((rc, self.lost(out)), (1, ["t.py::a"]))
+
+    def test_unreadable_collect_output_is_exit_2(self):
+        b = {"tests/test_a.py": self.T, "COLLECT.txt": "<Module test_a.py>\n3 tests collected\n"}
+        rc, out = self.run_collect(b, {"COLLECT.txt": "<Module test_a.py>\n2 tests collected\n"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no test ID could be read", "\n".join(out))
+
+    def test_collect_command_needs_git_mode(self):
+        rc, out = run_main(["--diff-file", os.path.join(FIXTURES, "weakened.diff"),
+                            "--collect-command", "true", "--summary-file", ""])
+        self.assertEqual(rc, 2)
+
+    def test_parse_pytest_and_vitest_output(self):
+        pytest_out = ("tests/test_a.py::test_x\ntests/test_a.py::TestK::test_y[unsupported operand]\n"
+                      "  tests/test_a.py::indented_warning_line\n\n3 tests collected in 0.01s\n"
+                      "ERROR tests/test_b.py::boom - nope\n")
+        self.assertEqual(guard.parse_collected(pytest_out), {
+            "tests/test_a.py::test_x", "tests/test_a.py::TestK::test_y[unsupported operand]"})
+        vitest_out = ("\x1b[32msrc/calc.test.js > adds\x1b[0m\nsrc/calc.test.js > suite > handles negatives\n"
+                      "[proj] test/x.spec.ts > ok\n RUN  v3.2.4 /tmp\n")
+        self.assertEqual(guard.parse_collected(vitest_out), {
+            "src/calc.test.js > adds", "src/calc.test.js > suite > handles negatives", "[proj] test/x.spec.ts > ok"})
+        self.assertEqual(guard.id_path("[proj] test/x.spec.ts > ok"), "test/x.spec.ts")
+        self.assertEqual(guard.id_path("tests/a.py::T::t[1]"), "tests/a.py")
+
+    def test_static_mode_says_it_is_static(self):
+        rc, out = run_main(["--diff-file", os.path.join(FIXTURES, "weakened.diff"), "--summary-file", ""])
+        self.assertTrue(out[-1].endswith("test deletions checked statically, not by the runner; set collect-command"))
+
+
+class CollectionConfigTests(unittest.TestCase):
+    def test_collection_config_changes_are_named(self):
+        for before, after in (
+            ({"pyproject.toml": "[tool.pytest.ini_options]\n"},
+             {"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'}),
+            ({"pytest.ini": "[pytest]\naddopts = -q\n"}, {"pytest.ini": "[pytest]\naddopts = -q --deselect tests/test_a.py::t\n"}),
+            ({"setup.cfg": "[tool:pytest]\n"}, {"setup.cfg": "[tool:pytest]\nnorecursedirs = legacy\n"}),
+            ({"tests/conftest.py": "import os\n"}, {"tests/conftest.py": "import os\ncollect_ignore = ['x.py']\n"}),
+            ({"vitest.config.ts": "export default { test: {} };\n"},
+             {"vitest.config.ts": "export default { test: {\n  exclude: ['test/**'],\n} };\n"}),
+            ({"package.json": '{\n  "jest": {}\n}\n'}, {"package.json": '{\n  "jest": {\n    "testMatch": ["x"]\n  }\n}\n'}),
+        ):
+            with self.subTest(after=after):
+                self.assertIn("collection-config-changed", kinds(findings(before, after)))
+
+    def test_unrelated_config_is_quiet(self):
+        b = {"pyproject.toml": '[project]\nname = "x"\n'}
+        a = {"pyproject.toml": '[project]\nname = "y"\n'}
+        self.assertEqual(findings(b, a), [])
+
+
 class OutputAndExitTests(unittest.TestCase):
     def run_main(self, argv):
         buf = io.StringIO()
@@ -639,7 +814,8 @@ class OutputAndExitTests(unittest.TestCase):
         rc, out = self.run_main(["--diff-file", p, "--summary-file", ""])
         self.assertEqual(rc, 0)
         self.assertEqual(out[-1], "assertion-guard: 0 finding(s) in 0 test file(s) scanned "
-                                  "(no test files changed in this diff, so no test could have been weakened)")
+                                  "(no test files changed in this diff); test deletions checked "
+                                  "statically, not by the runner; set collect-command")
 
     def test_empty_diff_says_so(self):
         rc, out = self.run_main(["--diff-file", self.write(""), "--summary-file", ""])

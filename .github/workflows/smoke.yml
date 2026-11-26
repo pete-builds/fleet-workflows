@@ -48,6 +48,24 @@ jobs:
         run: python3 -B assertion-guard/test_guard.py
       - name: Fixtures (weakened must fail exactly, clean refactor must pass)
         run: bash smoke/assertion-guard/check.sh
+      # The collection diff against the REAL runners, pinned: pytest 9.2.0 from a
+      # hash-checked lock, vitest 3.2.4 from its package-lock. A missing runner is a FAIL.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install the pinned runners
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/runner-py"
+          "$RUNNER_TEMP/runner-py/bin/pip" install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.lock
+          npm ci --prefix smoke/assertion-guard/runner-js --ignore-scripts --no-audit --no-fund
+      - name: Collection-diff fixtures (every round-three hole red, judged by the runner)
+        env:
+          RUNNER_PYTHON: ${{ runner.temp }}/runner-py/bin/python
+        run: python3 -B smoke/assertion-guard/runner_cases.py
 
   # The composite action end to end, in git mode, as a caller runs it. The fixtures above
   # prove the rules; this proves action.yml wires them. Each planted pair must end with
@@ -99,8 +117,24 @@ jobs:
         with:
           base: ${{ env.ctl_base2 }}
           head: ${{ env.ctl_head2 }}
-      - name: Require exit 1 and test-deleted from both
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: The action on pair 1 again, with the runner deciding (must fail with exit 1)
+        id: pair3
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base }}
+          head: ${{ env.ctl_head }}
+          collect-setup: python -m pip install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.lock
+          collect-command: python -m pytest --collect-only -q -p no:cacheprovider ctl-planted
+      - name: Require exit 1 and test-deleted from all three
         env:
+          P3_OUTCOME: ${{ steps.pair3.outcome }}
+          P3_EXIT: ${{ steps.pair3.outputs.exit-code }}
+          P3_KINDS: ${{ steps.pair3.outputs.kinds }}
+          P3_VERDICT: ${{ steps.pair3.outputs.verdict }}
           P1_OUTCOME: ${{ steps.pair1.outcome }}
           P1_EXIT: ${{ steps.pair1.outputs.exit-code }}
           P1_KINDS: ${{ steps.pair1.outputs.kinds }}
@@ -110,7 +144,7 @@ jobs:
         run: |
           set -u
           bad=0
-          for p in 1 2; do
+          for p in 1 2 3; do
             outcome_var="P${p}_OUTCOME"; exit_var="P${p}_EXIT"; kinds_var="P${p}_KINDS"
             outcome="${!outcome_var}"; code="${!exit_var}"; kinds="${!kinds_var}"
             if [ "$outcome" != failure ] || [ "$code" != 1 ]; then
@@ -121,12 +155,18 @@ jobs:
               *) echo "::error::pair $p: findings '$kinds' do not include test-deleted"; bad=1 ;;
             esac
           done
+          case "$P3_VERDICT" in
+            *"test deletions checked by the runner"*) ;;
+            *) echo "::error::pair 3 verdict does not say the runner decided: $P3_VERDICT"; bad=1 ;;
+          esac
           if [ "$bad" -ne 0 ]; then echo "assertion-guard action controls: FAIL"; exit 1; fi
-          echo "assertion-guard action controls: PASS (pair 1 exit $P1_EXIT [$P1_KINDS], pair 2 exit $P2_EXIT [$P2_KINDS])"
+          echo "assertion-guard action controls: PASS (pair 1 exit $P1_EXIT [$P1_KINDS], pair 2 exit $P2_EXIT [$P2_KINDS], pair 3 by the runner exit $P3_EXIT [$P3_KINDS])"
       - name: Back to the checkout this run started from
         run: git checkout -q "$ctl_orig"
-      - name: The action on this pull request (must pass unless the PR weakens a test)
+      - name: The action on this pull request, the runner deciding deletions (must pass unless the PR weakens a test)
         uses: ./assertion-guard
+        with:
+          collect-command: python -m pytest --collect-only -q -p no:cacheprovider
 
   # BOTH DIRECTIONS, in one job, against the same stale fixture:
   #   1. the drift check MUST FAIL on the stale lock (a check that cannot say no is not

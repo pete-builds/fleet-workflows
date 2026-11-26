@@ -1,0 +1,2 @@
+# The real runner for the assertion-guard collection-diff fixtures. Exact pin.
+pytest==9.2.0
