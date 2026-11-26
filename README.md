@@ -103,10 +103,25 @@ plus the config files that hold coverage floors, and reports:
 | Finding | Meaning |
 |---|---|
 | `net-assertion-loss` | a test file that still exists loses more assertions than it gains |
-| `loosened-assertion` | an exact check became a weaker one: `==` to `is not None` or `>=`, `toEqual` to `toBeDefined`, `toHaveBeenCalledWith` to `toHaveBeenCalled`, a specific error to `Exception`, a wider `approx` tolerance, fewer `toBeCloseTo` digits; or an added check over constants only (`assert 3 == 3`) |
+| `loosened-assertion` | an exact check became a weaker one: `==` to `is not None` or `>=`, `toEqual` to `toBeDefined`, `toHaveBeenCalledWith` to `toHaveBeenCalled`, a specific error to `Exception`, `assertRaisesRegex` to `assertRaises`, `toThrow('msg')` to `toThrow()`, a wider `approx` tolerance, fewer `toBeCloseTo` digits; or an added check over constants only (`assert 3 == 3`) |
 | `skip-added` | a skip or xfail on an existing test, or a `.only` anywhere |
-| `test-deleted` | a test removed and not re-added anywhere in the diff (renames, moves and parametrize consolidations are matched); a whole test file deleted, unless the source file it is named for is deleted in the same diff; a test file renamed, or a `class Test*` renamed, to where the runner no longer collects it |
+| `test-deleted` | a test the runner collected at the base is no longer collected at the head (see the invariant below): removed, moved into a file the runner does not collect (`conftest.py`, a helper module), its file or `class Test*` renamed out of collection, or its file deleted |
 | `coverage-floor-lowered` | `fail_under`, `--cov-fail-under` or a vitest/jest threshold lowered or removed |
+
+**The collection invariant.** Every test that the runner would collect at the base must
+still be collected at the head, unless (a) the code file it is named for was deleted in the
+same diff, or (b) it was consolidated into a parametrized test that keeps every expected
+value. One whole-diff check enforces it: collected test identities at the base, minus
+collected test identities at the head, minus the two excusals, is reported as
+`test-deleted`. A removed test only survives through a partner (same name, a look-alike
+body, a rename in place) that sits in a file the runner collects. "Collects" means default
+discovery: `test_*.py` and `*_test.py` for pytest; `__tests__/`, `test/`, `*.test.*` and
+`*.spec.*` for JS.
+
+**Stopping rule.** Two review rounds each found a high in this one mechanism (deciding
+whether a removed test survived elsewhere). If a third does, rename and move excusal is
+removed entirely: any collected test name that disappears is reported, false positives
+accepted, and the reviewer reads them.
 
 Test files are Python under `tests/` or `test/`, `test_*.py`, `*_test.py`, `conftest.py`, and
 TS/JS under `__tests__/`, `test/`, `tests/`, `*.test.*`, `*.spec.*`. In git mode the diff is
@@ -149,6 +164,23 @@ must print identical results. `smoke/assertion-guard/build-fixtures.sh` regenera
 fixtures from real git history.
 
 The action's outputs are `exit-code` (0, 1 or 2), `verdict` and `kinds`.
+
+The second review round's cases are permanent too (`smoke/assertion-guard/cases.py`, both
+modes, exact expected results), including one case per condition of the rename rule where
+only that condition stops a deleted test passing as renamed.
+
+**Known limits**, each pinned by a case in `cases.py` so a fix shows up as a deliberate
+change rather than drift:
+
+- Not detected yet: `== 3` replaced by `!= 0` (G3) or by `isinstance(...)` (G4); a
+  `raise unittest.SkipTest(...)` added inside a test (M4); vitest `test.runIf(false)` (M5).
+- False positives: a test renamed while one assertion is strengthened (R3) or an expected
+  value changed (R3b) reports `test-deleted`; test source written inside a string, such
+  as a `pytester.makepyfile` body, can trip the constant-assertion rule (K2).
+- By design: an added constant assertion such as `assert True` always fires (K3).
+- Editing a test in place (or renaming it while editing one setup line) is not read as a
+  weakening unless an assertion is removed or loosened (R1, R1b).
+- Go, Rust and Kotlin tests are not read.
 
 ## Releasing a change
 

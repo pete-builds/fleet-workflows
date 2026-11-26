@@ -11,9 +11,9 @@ Five finding types, each reported with a file, a line and one plain sentence:
   loosened-assertion      an exact check replaced by a weaker one in the same change, or
                           an added check over constants only, which cannot fail
   skip-added              a skip, xfail or .only was added
-  test-deleted            a test removed and not re-added anywhere in the diff; a whole
-                          test file deleted unless its subject source is deleted in the
-                          same diff; a test file or Test class renamed out of collection
+  test-deleted            a test the runner collected at the base is no longer collected
+                          at the head (THE COLLECTION INVARIANT, stated in full above
+                          classify_removed_tests and in the README)
 
 Git mode and --diff-file mode read the same diff and decide identically: the guard never
 consults the repository tree.
@@ -309,6 +309,11 @@ PY_ASSERT_STMT = re.compile(r"^assert\b")
 # `(msg,) = warnings()` raises unless there is exactly one item: an implicit length check.
 # Calibration: mcp-unifi#195 replaced `assert len(w) == 1` with it, a pure refactor.
 PY_SINGLE_UNPACK = re.compile(r"^\(?\s*[A-Za-z_]\w*\s*,\s*\)?\s*=(?!=)")
+# mock.assert_called_once_with(...) and friends are assertions: deleting one is a lost check
+# (round two M1, R4b).
+PY_MOCK_ASSERT = re.compile(
+    r"\.assert_(called|not_called|any_call|has_calls|awaited|not_awaited|any_await|has_awaits)\w*\s*\("
+)
 PY_SELF_ASSERT = re.compile(r"\bself\.assert\w*\s*\(|\bself\.fail\w*\s*\(")
 PY_RAISES = re.compile(r"\bpytest\.(raises|warns)\s*\(")
 PY_APPROX = re.compile(r"\bpytest\.approx\s*\(|(?<![\w.])approx\s*\(")
@@ -324,6 +329,7 @@ def count_assertions(text: str, lang: str) -> int:
         n = (1 if PY_ASSERT_STMT.search(s) or PY_SINGLE_UNPACK.search(s) else 0)
         n += len(PY_SELF_ASSERT.findall(s))
         n += len(PY_RAISES.findall(s))
+        n += len(PY_MOCK_ASSERT.findall(s))
         if n == 0 and PY_APPROX.search(s):
             # A standalone approx (expected = approx(...)) feeds a later assert. Inside an
             # assert line it is part of that one check, not a second one: counting it
@@ -475,17 +481,23 @@ def is_tautology(text: str, lang: str) -> bool:
             return m.group(1) == m.group(3)
         return True
     if PY_ASSERT_STMT.search(s):
-        cond = assert_condition(s).strip()
+        # A NUL byte inside a literal cannot be parsed as source; its escape can (X4).
+        cond = assert_condition(s).strip().replace("\x00", "\\x00")
         try:
             tree = ast.parse(cond, mode="eval")
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             return False
         return _constant_truth(tree) is True
     m = re.search(r"\bself\.assert(Equal|True|IsNotNone)\s*\((.*)\)\s*$", s)
     if m:
         try:
             tree = ast.parse(f"({m.group(2)},)", mode="eval")
-        except SyntaxError:
+        except (SyntaxError, ValueError):
+            return False
+        # `self.assertEqual(a, 1) if a else self.fail()` parses to a conditional, not a
+        # tuple: that is not a constant check, and an optional classifier must never turn
+        # into an exit 2 (round two X3).
+        if not isinstance(tree.body, ast.Tuple):
             return False
         args = tree.body.elts
         if not args or not all(isinstance(a, ast.Constant) for a in args):
@@ -498,6 +510,10 @@ def is_tautology(text: str, lang: str) -> bool:
 
 RAISES_ARG = re.compile(r"\b(?:pytest\.raises|assertRaises(?:Regex)?)\s*\(\s*([\w.]+)")
 GENERIC_EXC = {"Exception", "BaseException", "builtins.Exception", "builtins.BaseException"}
+UNITTEST_RAISES_REGEX = re.compile(r"\bassert(Raises|Warns)Regexp?\s*\(")
+UNITTEST_RAISES_PLAIN = re.compile(r"\bassert(Raises|Warns)\s*\(")
+JS_THROW_WITH_ARG = re.compile(r"\.(toThrow|toThrowError)\s*\(\s*[^)\s]")
+JS_THROW_BARE = re.compile(r"\.(toThrow|toThrowError)\s*\(\s*\)")
 RAISES_MATCH = re.compile(r"\bpytest\.raises\s*\(.*\bmatch\s*=")
 APPROX_KW = re.compile(r"\b(rel|abs)\s*=\s*([0-9][0-9_]*\.?[0-9_]*(?:[eE][-+]?\d+)?)")
 CLOSE_TO = re.compile(r"\.toBeCloseTo\s*\(([^)]*)\)")
@@ -579,6 +595,7 @@ class TestBlock:
     name: str
     indent: int
     body: list[Line] = field(default_factory=list)  # lines of the same kind inside it
+    kept: int = 0  # unchanged context lines seen inside it, in the same hunk
 
     def assertion_keys(self, lang: str) -> set[str]:
         return {norm(code_part(ln.text, lang)) for ln in self.body if count_assertions(ln.text, lang)}
@@ -611,8 +628,12 @@ def collect_tests(fd: FileDiff, kind: str) -> list[TestBlock]:
             if ln.kind != kind:
                 if ln.kind == " " and cur is not None and ln.text.strip():
                     indent = len(ln.text) - len(ln.text.lstrip())
-                    if indent <= cur.indent:
+                    # The `) -> None:` closing a multi-line signature sits at the def's
+                    # own indent and does not end the test (calibration: mcp-unifi#227).
+                    if indent <= cur.indent and not ln.text.lstrip().startswith((")", "}", "]")):
                         cur = None
+                    else:
+                        cur.kept += 1
                 continue
             t = test_name(ln.text, lang)
             if t:
@@ -666,23 +687,52 @@ def looks_like_rename(old: TestBlock, new: TestBlock) -> bool:
     return kept / len(old_lines) >= 0.8
 
 
+# ======================================================================================
+# THE COLLECTION INVARIANT (binding; the README states it too)
+#
+#   Every test that the runner would collect at the base must still be collected at the
+#   head, unless (a) the code file it is named for was deleted in the same diff, or
+#   (b) it was consolidated into a parametrized test that keeps every expected value.
+#
+# One whole-diff check enforces it: the collected test identities at the base, minus the
+# collected test identities at the head, minus the two excusals, is the set reported as
+# test-deleted. A test only "survives" through a partner (same name, a look-alike body, a
+# rename in place) when that partner sits in a file the runner COLLECTS at the head.
+#
+# Why it is stated this way: two review rounds found a high in the same mechanism,
+# deciding whether a removed test survived elsewhere. Round one: a test file renamed out
+# of the test paths. Round two: tests moved by name into conftest.py, a helper module,
+# or a file below git's rename threshold, each accepted because a same-named partner
+# existed somewhere. The partner's collection status was never asked.
+#
+# STOPPING RULE (set before round three): if another high is found in this mechanism,
+# rename and move excusal is removed entirely. Any collected test name that disappears
+# is reported as test-deleted, false positives accepted, and the reviewer reads them.
+# ======================================================================================
+
+
 def classify_removed_tests(tests: list[FileDiff]):
     """Decide what happened to every removed test.
 
     Returns (status, partner) per removed TestBlock, keyed by id(block.line):
-      "same-file"     re-added under the same name in the same file (rewritten in place)
-      "in-place"      its def line was replaced one-for-one by another (a rename)
-      "moved"         re-added under the same name in another file
-      "renamed"       its assertions re-appear together inside an added test of another name
-      "consolidated"  folded into a parametrized test: every string it used is re-added
-      "gone"          none of the above
+      "uncollected"   it sat in a file the runner did not collect at the base: not an
+                      identity the invariant protects
+      "same-file"     re-added under the same name in the same (collected) file
+      "in-place"      only its def line changed, to another test name, in a collected file
+      "moved"         re-added under the same name in another collected file
+      "renamed"       its whole body re-appears in a collected test of another name
+      "consolidated"  folded into a parametrized test that keeps every expected value
+      "gone"          none of the above: a collected identity lost
     """
     removed = [b for fd in tests for b in collect_tests(fd, "-")]
-    added = [b for fd in tests for b in collect_tests(fd, "+")]
-    in_place = renamed_in_place(tests)
+    # Partners only ever come from files the runner collects at the head.
+    collected = [fd for fd in tests if not fd.deleted and is_collected(fd.path)]
+    added = [b for fd in collected for b in collect_tests(fd, "+")]
+    in_place = renamed_in_place(collected)
     unclaimed = list(added)
-    added_text = "\n".join(ln.text for fd in tests for ln in fd.lines("+"))
-    has_param = any(PARAMETRIZE.search(ln.text) for fd in tests for ln in fd.lines("+"))
+    added_text = "\n".join(ln.text for fd in collected for ln in fd.lines("+"))
+    added_norm = norm(added_text)
+    has_param = any(PARAMETRIZE.search(ln.text) for fd in collected for ln in fd.lines("+"))
     result: dict[int, tuple[str, TestBlock | None]] = {}
 
     def claim(pred) -> TestBlock | None:
@@ -694,10 +744,17 @@ def classify_removed_tests(tests: list[FileDiff]):
 
     for rb in removed:
         lang = language(rb.fd.path)
-        # A def swapped for another def is a rename only when its body stayed as context.
-        # If its assertions were removed too, it is judged by the rules below instead, so
-        # swapping a strict test for an unrelated weak one cannot pass as a rename.
-        if id(rb.line) in in_place and not rb.assertion_keys(lang):
+        if not is_collected(rb.fd.old_path or ""):
+            result[id(rb.line)] = ("uncollected", None)
+            continue
+        # A rename in place: the def line swapped one-for-one, no removed body line holds
+        # an assertion, and at least half of the body is unchanged context. A body that
+        # was replaced is judged by the rules below, so swapping a test for an unrelated
+        # one cannot pass as a rename (round two R4, R4b), while renaming a test and
+        # editing one setup line still can (R1).
+        changed = [ln for ln in rb.body if ln.text.strip()]
+        if (id(rb.line) in in_place and not rb.assertion_keys(lang)
+                and rb.kept > 0 and rb.kept >= len(changed)):
             result[id(rb.line)] = ("in-place", None)
             continue
         partner = claim(lambda b: b.name == rb.name and b.fd is rb.fd)
@@ -714,9 +771,18 @@ def classify_removed_tests(tests: list[FileDiff]):
                 result[id(rb.line)] = ("renamed", partner)
                 continue
         # Calibration: mcp-unifi#195 folded five one-case tests into one parametrized test.
-        # Every message and input survived as a row of the parameter table.
+        # Every message and input survived as a row of the parameter table. Every expected
+        # value of an `==` check must survive too, not just the strings: otherwise a
+        # deleted `== 401` check hides behind its URL reused in a parameter list (R5).
         lits = rb.literals()
-        if has_param and lits and any(len(x) >= 6 for x in lits) and all(x in added_text for x in lits):
+        expected = {
+            norm(code_part(ln.text, lang)).split("==", 1)[1]
+            for ln in rb.body
+            if count_assertions(ln.text, lang) and "==" in code_part(ln.text, lang)
+        }
+        if (has_param and lits and any(len(x) >= 6 for x in lits)
+                and all(x in added_text for x in lits)
+                and all(e in added_norm for e in expected)):
             result[id(rb.line)] = ("consolidated", None)
             continue
         result[id(rb.line)] = ("gone", None)
@@ -927,6 +993,21 @@ def detect(fds: list[FileDiff]) -> list[Finding]:
                         f"The expected error was widened from {om.group(1)} to {nm.group(1)}, "
                         f"so the test now passes on any error, including the wrong one.",
                     ))
+                # assertRaisesRegex -> assertRaises, toThrow('msg') -> toThrow(): the
+                # message check is gone, any error of the type now passes (round two M2, M3).
+                for old_re, new_re, what in (
+                    (UNITTEST_RAISES_REGEX, UNITTEST_RAISES_PLAIN, "assertRaisesRegex became assertRaises"),
+                    (JS_THROW_WITH_ARG, JS_THROW_BARE, "toThrow lost its expected message"),
+                ):
+                    r_n = sum(1 for ln in removed if old_re.search(code_part(ln.text, lang)))
+                    a_n = sum(1 for ln in added if old_re.search(code_part(ln.text, lang)))
+                    a_bare = [ln for ln in added if new_re.search(code_part(ln.text, lang))]
+                    for new in a_bare[: max(0, r_n - a_n)]:
+                        findings.append(Finding(
+                            "loosened-assertion", fd.path, new.new_no,
+                            f"The expected error lost its message check ({what}), so any "
+                            f"error of that type now passes.",
+                        ))
                 # pytest.raises(..., match=...) lost its match.
                 r_m = [ln for ln in removed if RAISES_MATCH.search(ln.text)]
                 a_raises = [ln for ln in added if re.search(r"\bpytest\.raises\s*\(", ln.text)]
@@ -994,39 +1075,38 @@ def detect(fds: list[FileDiff]) -> list[Finding]:
                     f"`{marker.strip()}` was added, which {what}.",
                 ))
 
-    # ---- 4. test-deleted -------------------------------------------------------------
-    deleted_source_stems = {
+    # ---- 4. test-deleted: the collection invariant --------------------------------------
+    # Excusal (a): only a deleted CODE file excuses, never docs/security.md (round two R7).
+    deleted_code_stems = {
         fd.old_path.split("/")[-1].rsplit(".", 1)[0]
-        for fd in fds if fd.deleted and fd.old_path and not is_test_file(fd.old_path)
+        for fd in fds if fd.deleted and fd.old_path and language(fd.old_path)
+        and not is_test_file(fd.old_path)
     }
 
-    def subject_remains(path: str) -> bool:
-        # Only a source file deleted in THIS diff excuses a deleted test file. The tree
-        # never does: test files are often named for a feature (test_security.py) rather
-        # than a module, so "no file of that name remains" proved nothing, and in git mode
-        # it let 48 of mcp-unifi's 94 test files be deleted whole with a green guard
-        # (review finding F1).
+    def excused(path: str) -> bool:
         stem = subject_stem(path)
-        return stem is None or stem not in deleted_source_stems
+        return stem is not None and stem in deleted_code_stems
 
-    gone_by_file: dict[str, list[TestBlock]] = {}
+    lost_by_file: dict[str, list[TestBlock]] = {}
     for rb in removed_tests:
-        if status[id(rb.line)][0] == "gone":
-            gone_by_file.setdefault(rb.fd.path, []).append(rb)
+        if status[id(rb.line)][0] == "gone" and not excused(rb.fd.old_path or rb.fd.path):
+            lost_by_file.setdefault(rb.fd.old_path or rb.fd.path, []).append(rb)
     for fd in tests:
-        if fd.deleted:
-            gone = gone_by_file.get(fd.path, [])
-            if gone and subject_remains(fd.old_path or fd.path):
-                findings.append(Finding(
-                    "test-deleted", fd.old_path or fd.path, 1,
-                    f"This whole test file was deleted ({len(gone)} test(s) not re-added "
-                    f"anywhere) while the code it tests is still there.",
-                ))
+        lost = lost_by_file.get(fd.old_path or fd.path, [])
+        if not lost:
             continue
-        for rb in gone_by_file.get(fd.path, []):
+        if fd.deleted:
+            findings.append(Finding(
+                "test-deleted", fd.old_path or fd.path, 1,
+                f"This whole test file was deleted ({len(lost)} test(s) not re-added in any "
+                f"file the runner collects) while the code it tests is still there.",
+            ))
+            continue
+        for rb in lost:
             findings.append(Finding(
                 "test-deleted", fd.path, max(1, rb.line.new_no),
-                f"The test `{rb.name}` was removed and is not re-added anywhere in this change.",
+                f"The test `{rb.name}` was removed and is not re-added in any file the "
+                f"test runner collects.",
             ))
 
     # A `class Test*` renamed to a name pytest does not collect: every method in it stops

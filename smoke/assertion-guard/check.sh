@@ -14,7 +14,8 @@
 # disagreed on deleted test files (review finding F1). A fixture proven in one mode only
 # proves nothing about the other.
 #
-# Then probes.sh: the independent reviewer's probes, each a real repo, both modes.
+# Then probes.sh (round-one review probes) and cases.py (round-two review cases and the
+# rename-rule ratchet): each a real repo, both modes, exact expected findings.
 #
 # The last line is always a verdict. No verdict line means the control did not run.
 set -uo pipefail
@@ -80,8 +81,11 @@ case "$(printf '%s\n' "$out" | tail -n 1)" in
   *) echo "::error::clean-refactor fixture: verdict is not '0 finding(s)' over a non-zero file count"; fail=1 ;;
 esac
 
-# --- the reviewer's probes -----------------------------------------------------------
+# --- the reviewers' probes and cases --------------------------------------------------
 if ! bash "$fx/probes.sh"; then
+  fail=1
+fi
+if ! python3 -B "$fx/cases.py"; then
   fail=1
 fi
 
@@ -89,4 +93,4 @@ if [ "$fail" -ne 0 ]; then
   echo "assertion-guard smoke: FAIL"
   exit 1
 fi
-echo "assertion-guard smoke: PASS (weakened: $n_want expected findings, exit 1; clean refactor: 0 findings, exit 0; both modes identical; probes pass)"
+echo "assertion-guard smoke: PASS (weakened: $n_want expected findings, exit 1; clean refactor: 0 findings, exit 0; both modes identical; probes and cases pass)"
