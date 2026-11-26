@@ -1448,7 +1448,10 @@ JS_COLLECT_KEY = re.compile(
 JEST_PKG_KEY = re.compile(r"\"(testMatch|testPathIgnorePatterns|testRegex|roots)\"\s*:")
 # A workflow that changes how the guard itself collects (review round four, F4).
 WORKFLOW_FILE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
-WORKFLOW_GUARD_KEY = re.compile(r"collect-command|collect-setup|assertion-guard")
+# Only the guard's own setup: its inputs, or a `uses:` of the action. Not every line that
+# mentions it (a comment, an echo, a script path), which made this PR's own run red.
+WORKFLOW_GUARD_KEY = re.compile(
+    r"^\s*(?:-\s+)?(?:collect-command|collect-setup)\s*:|^\s*(?:-\s+)?uses:\s*\S*assertion-guard\b")
 
 
 def collection_config_findings(fds: list[FileDiff]) -> list[Finding]:

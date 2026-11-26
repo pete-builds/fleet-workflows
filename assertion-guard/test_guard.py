@@ -927,6 +927,14 @@ class CollectionConfigTests(unittest.TestCase):
         self.assertIn("collection-config-changed", kinds(findings(b, a)))
         other = {".github/workflows/ci.yml": "on: push\n"}
         self.assertEqual(findings(other, {".github/workflows/ci.yml": "on: pull_request\n"}), [])
+        # Lines that only mention the guard are not its setup.
+        talk = {".github/workflows/ci.yml": "jobs:\n  g:\n    steps:\n      - run: echo ok\n"}
+        self.assertEqual(findings(talk, {".github/workflows/ci.yml": talk[".github/workflows/ci.yml"]
+                                         + "      # assertion-guard runs elsewhere\n"
+                                         + "      - run: bash smoke/assertion-guard/check.sh\n"}), [])
+        uses = {".github/workflows/ci.yml": "jobs:\n  g:\n    steps:\n      - uses: x/assertion-guard@v1\n"}
+        self.assertIn("collection-config-changed", kinds(findings(
+            uses, {".github/workflows/ci.yml": uses[".github/workflows/ci.yml"].replace("@v1", "@v2")})))
 
     def test_unrelated_config_is_quiet(self):
         b = {"pyproject.toml": '[project]\nname = "x"\n'}

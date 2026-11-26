@@ -163,10 +163,28 @@ jobs:
           echo "assertion-guard action controls: PASS (pair 1 exit $P1_EXIT [$P1_KINDS], pair 2 exit $P2_EXIT [$P2_KINDS], pair 3 by the runner exit $P3_EXIT [$P3_KINDS])"
       - name: Back to the checkout this run started from
         run: git checkout -q "$ctl_orig"
-      - name: The action on this pull request, the runner deciding deletions (must pass unless the PR weakens a test)
+      - name: The action on this pull request, the runner deciding deletions
+        id: self
+        continue-on-error: true
         uses: ./assertion-guard
         with:
           collect-command: python -m pytest --collect-only -q -p no:cacheprovider
+      # Green, or red ONLY because the PR edits this workflow's own guard setup (which the
+      # guard rightly names as collection-config-changed). Any other finding, a lost test
+      # above all, or an exit 2, fails here.
+      - name: Require this pull request to pass the guard
+        env:
+          EXIT: ${{ steps.self.outputs.exit-code }}
+          KINDS: ${{ steps.self.outputs.kinds }}
+          VERDICT: ${{ steps.self.outputs.verdict }}
+        run: |
+          set -u
+          if [ "$EXIT" = 0 ] || { [ "$EXIT" = 1 ] && [ "$KINDS" = collection-config-changed ]; }; then
+            echo "this pull request: PASS (exit $EXIT [$KINDS]) $VERDICT"
+          else
+            echo "::error::this pull request: exit $EXIT [$KINDS]; want 0, or 1 with only collection-config-changed"
+            exit 1
+          fi
 
   # BOTH DIRECTIONS, in one job, against the same stale fixture:
   #   1. the drift check MUST FAIL on the stale lock (a check that cannot say no is not
