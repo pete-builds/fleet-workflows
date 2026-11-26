@@ -3,6 +3,6 @@
   "private": true,
   "description": "Pinned vitest for the assertion-guard collection-diff fixtures. Not a published package.",
   "devDependencies": {
-    "vitest": "3.2.4"
+    "vitest": "4.1.11"
   }
 }
