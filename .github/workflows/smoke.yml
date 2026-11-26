@@ -12,8 +12,9 @@ name: smoke
 # `uses: ./lockfile-recompile` tests HEAD of this repo, so run this BEFORE tagging a
 # release, and pin callers only to tags whose smoke passed.
 #
-# The three lockfile jobs open real PRs, so they run on manual dispatch ONLY. The
-# assertion-guard controls write nothing and run on every push and pull request.
+# `smoke` and `rerun-over-an-existing-branch` push a branch and open a real PR, so they run
+# on manual dispatch ONLY. `drift-check` and the assertion-guard controls write nothing
+# and run on every push and pull request.
 
 on:
   workflow_dispatch:
@@ -49,8 +50,9 @@ jobs:
         run: bash smoke/assertion-guard/check.sh
 
   # The composite action end to end, in git mode, as a caller runs it. The fixtures above
-  # prove the rules; this proves action.yml wires them: it must FAIL on a commit pair
-  # that deletes a test, then PASS on this pull request itself.
+  # prove the rules; this proves action.yml wires them. Each planted pair must end with
+  # exit code 1 AND a test-deleted finding: "any failure" would also accept exit 2, a guard
+  # that could not read the diff at all. Then the action must PASS on this pull request.
   assertion-guard-action:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -58,32 +60,69 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - name: Plant two local commits, the second deleting a test
+      - name: Plant commit pairs that each delete a test
         run: |
           set -euo pipefail
           git config user.name ctl
           git config user.email ctl@example.invalid
           echo "ctl_orig=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          # Pair 1: one test removed from a file that stays.
           mkdir -p ctl-planted/tests
-          printf 'def test_kept():\n    assert 1 == 1\n\n\ndef test_dropped():\n    assert 2 == 2\n' \
+          printf 'def test_kept():\n    assert keep() == 1\n\n\ndef test_dropped():\n    assert drop() == 2\n' \
             > ctl-planted/tests/test_ctl.py
           git add ctl-planted && git commit -qm "ctl: two tests"
           echo "ctl_base=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          printf 'def test_kept():\n    assert 1 == 1\n' > ctl-planted/tests/test_ctl.py
+          printf 'def test_kept():\n    assert keep() == 1\n' > ctl-planted/tests/test_ctl.py
           git commit -qam "ctl: drop one"
           echo "ctl_head=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-      - name: The action on the planted pair (must fail)
-        id: must_fail
+          # Pair 2 (review finding F1): a whole test file named for a feature, not a
+          # module, deleted while the code it tests stays. Git mode once excused this.
+          mkdir -p ctl-planted/src/app
+          printf 'def login(u, p):\n    return u == "a" and p == "b"\n' > ctl-planted/src/app/auth.py
+          printf 'def test_rejects_bad_password():\n    assert login("a", "x") is False\n' \
+            > ctl-planted/tests/test_security.py
+          git add ctl-planted && git commit -qm "ctl: feature-named test file"
+          echo "ctl_base2=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git rm -q ctl-planted/tests/test_security.py && git commit -qm "ctl: delete it"
+          echo "ctl_head2=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: The action on pair 1, a test removed (must fail with exit 1)
+        id: pair1
         continue-on-error: true
         uses: ./assertion-guard
         with:
           base: ${{ env.ctl_base }}
           head: ${{ env.ctl_head }}
-      - name: Require the failure
-        if: steps.must_fail.outcome != 'failure'
+      - name: The action on pair 2, a feature-named test file deleted (must fail with exit 1)
+        id: pair2
+        continue-on-error: true
+        uses: ./assertion-guard
+        with:
+          base: ${{ env.ctl_base2 }}
+          head: ${{ env.ctl_head2 }}
+      - name: Require exit 1 and test-deleted from both
+        env:
+          P1_OUTCOME: ${{ steps.pair1.outcome }}
+          P1_EXIT: ${{ steps.pair1.outputs.exit-code }}
+          P1_KINDS: ${{ steps.pair1.outputs.kinds }}
+          P2_OUTCOME: ${{ steps.pair2.outcome }}
+          P2_EXIT: ${{ steps.pair2.outputs.exit-code }}
+          P2_KINDS: ${{ steps.pair2.outputs.kinds }}
         run: |
-          echo "::error::assertion-guard passed a commit that deletes a test: it can never say no"
-          exit 1
+          set -u
+          bad=0
+          for p in 1 2; do
+            outcome_var="P${p}_OUTCOME"; exit_var="P${p}_EXIT"; kinds_var="P${p}_KINDS"
+            outcome="${!outcome_var}"; code="${!exit_var}"; kinds="${!kinds_var}"
+            if [ "$outcome" != failure ] || [ "$code" != 1 ]; then
+              echo "::error::pair $p: outcome '$outcome', exit '$code'; want failure with exit 1"; bad=1
+            fi
+            case ",$kinds," in
+              *,test-deleted,*) ;;
+              *) echo "::error::pair $p: findings '$kinds' do not include test-deleted"; bad=1 ;;
+            esac
+          done
+          if [ "$bad" -ne 0 ]; then echo "assertion-guard action controls: FAIL"; exit 1; fi
+          echo "assertion-guard action controls: PASS (pair 1 exit $P1_EXIT [$P1_KINDS], pair 2 exit $P2_EXIT [$P2_KINDS])"
       - name: Back to the checkout this run started from
         run: git checkout -q "$ctl_orig"
       - name: The action on this pull request (must pass unless the PR weakens a test)
@@ -95,9 +134,12 @@ jobs:
   #   2. after fixing the lock in the working tree, the SAME check MUST PASS (a check
   #      that cannot say yes is not a check either; a redaction pass that matches
   #      nothing looks exactly like a clean one).
+  #
+  # Read only (it opens nothing and pushes nothing), so it runs on every push and PR.
   drift-check:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - name: Drift check against the stale control lock (must fail)

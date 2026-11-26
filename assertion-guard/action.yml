@@ -52,9 +52,44 @@ runs:
         # No verdict is reached here: if the history is still unusable, guard.py's own
         # `git diff` fails and it prints an ERROR line and exits 2, never a clean pass.
 
+    # Runs the guard without failing, so its outputs are always published; the next step
+    # fails with the guard's own exit code (1 findings, 2 no verdict).
     - name: Read the test changes
+      id: guard
       shell: bash
       env:
         GUARD_BASE_SHA: ${{ inputs.base || github.event.pull_request.base.sha }}
         GUARD_HEAD_SHA: ${{ inputs.head || github.event.pull_request.head.sha }}
-      run: python3 -B "${GITHUB_ACTION_PATH}/guard.py"
+      run: |
+        set +e
+        log="$(mktemp)"
+        python3 -B "${GITHUB_ACTION_PATH}/guard.py" | tee "$log"
+        status="${PIPESTATUS[0]}"
+        set -e
+        {
+          echo "exit-code=$status"
+          echo "verdict=$(tail -n 1 "$log")"
+          echo "kinds=$(awk -F'\t' 'NF >= 3 { print $1 }' "$log" | sort -u | paste -sd, -)"
+        } >> "$GITHUB_OUTPUT"
+        rm -f "$log"
+
+    - name: Fail unless the guard passed
+      if: steps.guard.outputs.exit-code != '0'
+      shell: bash
+      env:
+        STATUS: ${{ steps.guard.outputs.exit-code }}
+        VERDICT: ${{ steps.guard.outputs.verdict }}
+      run: |
+        echo "$VERDICT"
+        exit "${STATUS:-2}"
+
+outputs:
+  exit-code:
+    description: The guard's exit code. 0 no findings, 1 findings, 2 no verdict.
+    value: ${{ steps.guard.outputs.exit-code }}
+  verdict:
+    description: The guard's final verdict line.
+    value: ${{ steps.guard.outputs.verdict }}
+  kinds:
+    description: Comma-separated finding types reported (empty when none).
+    value: ${{ steps.guard.outputs.kinds }}

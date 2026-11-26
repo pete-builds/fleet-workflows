@@ -66,13 +66,52 @@ class Repo:
         self._tmp.cleanup()
 
 
+def run_main(argv: list[str], cwd: str | None = None) -> tuple[int, list[str]]:
+    buf = io.StringIO()
+    old = os.getcwd()
+    try:
+        if cwd:
+            os.chdir(cwd)
+        with contextlib.redirect_stdout(buf):
+            rc = guard.main(argv)
+    finally:
+        os.chdir(old)
+    return rc, buf.getvalue().splitlines()
+
+
+def both_modes(repo: Repo) -> tuple[int, list[str]]:
+    """Run the guard on one change in BOTH modes and require identical results: git mode
+    (what CI runs) and --diff-file mode (what an offline replay runs). Calibration once ran
+    only --diff-file while CI ran git mode, and the two disagreed (review finding F1)."""
+    text = repo.diff()
+    if not text.strip():
+        raise AssertionError("case produced an empty diff: the edit matched nothing")
+    fd, path = tempfile.mkstemp(suffix=".diff")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    try:
+        rc_d, out_d = run_main(["--diff-file", path, "--no-annotations", "--summary-file", ""])
+    finally:
+        os.remove(path)
+    rc_g, out_g = run_main(["--base", repo.base, "--head", repo.head, "--no-annotations",
+                            "--summary-file", ""], cwd=repo.dir)
+    if (rc_d, out_d) != (rc_g, out_g):
+        raise AssertionError(
+            f"git mode and --diff-file mode disagree:\n  diff-file exit {rc_d}: {out_d}\n"
+            f"  git       exit {rc_g}: {out_g}")
+    return rc_g, out_g
+
+
 def findings(before: dict[str, str], after: dict[str, str | None]) -> list[guard.Finding]:
     repo = Repo(before, after)
     try:
-        text = repo.diff()
-        if not text.strip():
-            raise AssertionError("case produced an empty diff: the edit matched nothing")
-        return guard.detect(guard.parse_diff(text))
+        rc, out = both_modes(repo)
+        result = guard.detect(guard.parse_diff(repo.diff()))
+        # The in-process result must be what main() printed, finding for finding.
+        printed = [ln for ln in out if "\t" in ln]
+        assert printed == [f"{f.kind}\t{f.path}:{f.line}\t{f.message}" for f in result], out
+        assert rc == (1 if result else 0), (rc, out)
+        return result
     finally:
         repo.close()
 
@@ -300,25 +339,25 @@ class SkipAddedTests(unittest.TestCase):
             "import pytest\n", "import pytest\n\npytestmark = pytest.mark.skip\n")
         self.assertEqual(kinds(findings(PY_BASE, after)), ["skip-added"])
         after = dict(PY_BASE)
-        after["tests/test_new.py"] = "import pytest\n\npytestmark = pytest.mark.skip\n\n\ndef test_n():\n    assert 1\n"
+        after["tests/test_new.py"] = "import pytest\n\npytestmark = pytest.mark.skip\n\n\ndef test_n():\n    assert one()\n"
         self.assertEqual(findings(PY_BASE, after), [])
 
     def test_js_skip_and_focus(self):
-        b = {"src/a.test.ts": "it('a', () => {\n  expect(1).toBe(1);\n});\n"}
+        b = {"src/a.test.ts": "it('a', () => {\n  expect(one()).toBe(1);\n});\n"}
         for new in ("it.skip('a'", "xit('a'", "it.only('a'"):
             with self.subTest(new=new):
                 a = {"src/a.test.ts": b["src/a.test.ts"].replace("it('a'", new)}
                 self.assertEqual(kinds(findings(b, a)), ["skip-added"])
 
     def test_focus_on_a_new_test_still_fires(self):
-        b = {"src/a.test.ts": "it('a', () => {\n  expect(1).toBe(1);\n});\n"}
-        a = {"src/a.test.ts": b["src/a.test.ts"] + "it.only('b', () => {\n  expect(2).toBe(2);\n});\n"}
+        b = {"src/a.test.ts": "it('a', () => {\n  expect(one()).toBe(1);\n});\n"}
+        a = {"src/a.test.ts": b["src/a.test.ts"] + "it.only('b', () => {\n  expect(two()).toBe(2);\n});\n"}
         self.assertEqual(kinds(findings(b, a)), ["skip-added"])
 
     def test_moved_skip_is_quiet(self):
-        b = {"tests/test_a.py": "import pytest\n\n\n@pytest.mark.skip(reason='x')\ndef test_a():\n    assert 1 == 1\n"}
+        b = {"tests/test_a.py": "import pytest\n\n\n@pytest.mark.skip(reason='x')\ndef test_a():\n    assert one() == 1\n"}
         a = {"tests/test_a.py": None,
-             "tests/test_b.py": "import pytest\n\n\n@pytest.mark.skip(reason='x')\ndef test_a():\n    assert 1 == 1\n"}
+             "tests/test_b.py": "import pytest\n\n\n@pytest.mark.skip(reason='x')\ndef test_a():\n    assert one() == 1\n"}
         self.assertEqual(findings(b, a), [])
 
 
@@ -377,8 +416,8 @@ class TestDeletedTests(unittest.TestCase):
         self.assertEqual(findings(b, {"tests/test_parse.py": None, "src/parse.py": None}), [])
 
     def test_js_test_removed(self):
-        b = {"src/a.test.ts": "it('a', () => {\n  expect(1).toBe(1);\n});\n\nit('b', () => {\n  expect(2).toBe(2);\n});\n"}
-        a = {"src/a.test.ts": "it('a', () => {\n  expect(1).toBe(1);\n});\n"}
+        b = {"src/a.test.ts": "it('a', () => {\n  expect(one()).toBe(1);\n});\n\nit('b', () => {\n  expect(two()).toBe(2);\n});\n"}
+        a = {"src/a.test.ts": "it('a', () => {\n  expect(one()).toBe(1);\n});\n"}
         self.assertEqual(kinds(findings(b, a)), ["test-deleted"])
 
 
@@ -409,6 +448,172 @@ class CoverageFloorTests(unittest.TestCase):
         bv = {"vitest.config.ts": "export default { test: { coverage: { thresholds: { lines: 90 } } } };\n"}
         av = {"vitest.config.ts": bv["vitest.config.ts"].replace("lines: 90", "lines: 10")}
         self.assertEqual(kinds(findings(bv, av)), ["coverage-floor-lowered"])
+
+
+class ReviewFindingTests(unittest.TestCase):
+    """One case per finding from the independent review of PR #6, each through both modes
+    (via findings()), next to the legitimate change it must leave alone."""
+
+    def test_f1_feature_named_test_file_deleted_fires(self):
+        b = {"src/app/auth.py": "def login(u, p):\n    return u == 'a'\n",
+             "tests/test_security.py": "def test_rejects():\n    assert login('a', 'x') is False\n"}
+        self.assertEqual(kinds(findings(b, {"tests/test_security.py": None})), ["test-deleted"])
+
+    def test_f1_test_for_a_package_deleted_fires(self):
+        b = {"src/pkg/tools/__init__.py": "def run():\n    return 1\n",
+             "tests/test_tools.py": "def test_run():\n    assert run() == 1\n"}
+        self.assertEqual(kinds(findings(b, {"tests/test_tools.py": None})), ["test-deleted"])
+
+    def test_f1_subject_deleted_in_the_same_diff_is_quiet(self):
+        b = {"src/app/security.py": "def ok():\n    return True\n",
+             "tests/test_security.py": "def test_ok():\n    assert ok() is True\n"}
+        self.assertEqual(findings(b, {"tests/test_security.py": None, "src/app/security.py": None}), [])
+
+    CALC = {"src/calc.py": "def add(a, b):\n    return a + b\n",
+            "tests/test_calc.py": "def test_add():\n    assert add(1, 2) == 3\n"}
+
+    def _rename(self, new_path: str, content: str | None = None) -> list[guard.Finding]:
+        after = {"tests/test_calc.py": None, new_path: content or self.CALC["tests/test_calc.py"]}
+        return findings(self.CALC, after)
+
+    def test_f2_renamed_out_of_the_test_paths_fires(self):
+        fs = self._rename("attic/calc_checks.py")
+        self.assertEqual(kinds(fs), ["test-deleted"])
+        self.assertIn("no longer collects", fs[0].message)
+
+    def test_f2_renamed_to_an_uncollected_name_inside_tests_fires(self):
+        self.assertEqual(kinds(self._rename("tests/calc_checks.py")), ["test-deleted"])
+
+    def test_f2_renamed_and_gutted_fires(self):
+        self.assertEqual(kinds(self._rename("attic/calc_checks.py", "def test_add():\n    add(1, 2)\n")),
+                         ["test-deleted"])
+
+    def test_f2_renamed_within_collection_is_quiet(self):
+        self.assertEqual(self._rename("tests/unit/test_calc.py"), [])
+        self.assertEqual(self._rename("tests/calc_test.py"), [])
+
+    def test_f3_gitattributes_cannot_hide_test_changes(self):
+        b = dict(self.CALC)
+        b["tests/test_calc.py"] = "def test_add():\n    assert add(1, 2) == 3\n    assert add(2, 2) == 4\n"
+        a = {".gitattributes": "tests/** -diff\n", "tests/test_calc.py": "def test_add():\n    add(1, 2)\n"}
+        repo = Repo(b, a)
+        try:
+            # git mode reads through the attribute with --text.
+            rc, out = run_main(["--base", repo.base, "--head", repo.head, "--no-annotations",
+                                "--summary-file", ""], cwd=repo.dir)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("net-assertion-loss", "\n".join(out))
+            # A plain `git diff` (what a replay file holds) shows "Binary files differ":
+            # that is an error, never "no test files changed".
+            text = repo.diff()
+            self.assertIn("Binary files", text)
+            fd, path = tempfile.mkstemp(suffix=".diff")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+            try:
+                rc, out = run_main(["--diff-file", path, "--summary-file", ""])
+            finally:
+                os.remove(path)
+            self.assertEqual(rc, 2, out)
+            self.assertTrue(out[-1].startswith("assertion-guard: ERROR:"), out)
+        finally:
+            repo.close()
+
+    def test_f4_singular_test_directory(self):
+        b = {"test/add.js": "it('adds', () => {\n  assert.strictEqual(add(1, 2), 3);\n  assert.strictEqual(add(2, 2), 4);\n});\n"}
+        a = {"test/add.js": "it('adds', () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n"}
+        self.assertEqual(kinds(findings(b, a)), ["net-assertion-loss"])
+        bp = {"test/test_x.py": "def test_x():\n    assert f() == 1\n    assert g() == 2\n"}
+        ap = {"test/test_x.py": "def test_x():\n    assert f() == 1\n"}
+        self.assertEqual(kinds(findings(bp, ap)), ["net-assertion-loss"])
+
+    def test_f5_generic_assertion_does_not_make_a_rename(self):
+        b = {"tests/test_api.py": (
+            "def test_admin_requires_auth(client):\n    r = client.get('/admin')\n    assert r.status_code == 401\n\n\n"
+            "def test_health(client):\n    r = client.get('/health')\n    assert r.status_code == 200\n")}
+        a = {"tests/test_api.py": (
+            "def test_health(client):\n    r = client.get('/health')\n    assert r.status_code == 200\n\n\n"
+            "def test_ping(client):\n    r = client.get('/ping')\n    assert r.status_code == 401\n")}
+        fs = findings(b, a)
+        self.assertEqual(kinds(fs), ["test-deleted"])
+        self.assertIn("test_admin_requires_auth", fs[0].message)
+
+    def test_f5_real_rename_with_setup_is_still_quiet(self):
+        b = {"tests/test_api.py": "def test_admin(client):\n    r = client.get('/admin')\n    assert r.status_code == 401\n"}
+        a = {"tests/test_api.py": None,
+             "tests/test_auth.py": "def test_admin_requires_auth(client):\n    r = client.get('/admin')\n    assert r.status_code == 401\n"}
+        self.assertEqual(findings(b, a), [])
+
+    def test_f7_build_folder_inside_tests_is_in_scope(self):
+        b = {"tests/build/test_mk.py": "def test_mk():\n    assert mk() == 1\n\n\ndef test_mk2():\n    assert mk() == 2\n"}
+        a = {"tests/build/test_mk.py": "def test_mk():\n    assert mk() == 1\n"}
+        self.assertEqual(kinds(findings(b, a)), ["test-deleted"])
+        self.assertFalse(guard.is_test_file("build/lib/tests/test_mk.py"))
+        self.assertFalse(guard.is_test_file("dist/x.test.js"))
+        self.assertTrue(guard.is_test_file("src/build/x.test.js"))
+
+    def test_f6_mark_skip_after_import(self):
+        b = {"tests/test_m.py": "from pytest import mark\n\n\ndef test_a():\n    assert f() == 3\n"}
+        a = {"tests/test_m.py": "from pytest import mark\n\n\n@mark.skip(reason='x')\ndef test_a():\n    assert f() == 3\n"}
+        self.assertEqual(kinds(findings(b, a)), ["skip-added"])
+
+    def test_f6_constant_assertions(self):
+        for old, new in (("assert f() == 3", "assert 3 == 3"), ("assert f() == 3", "assert True"),
+                         ("self.assertEqual(f(), 3)", "self.assertEqual(3, 3)")):
+            with self.subTest(new=new):
+                b = {"tests/test_c.py": f"def test_c():\n    {old}\n"}
+                a = {"tests/test_c.py": f"def test_c():\n    {new}\n"}
+                self.assertIn("loosened-assertion", kinds(findings(b, a)))
+        b = {"src/c.test.ts": "it('c', () => {\n  expect(f()).toBe(3);\n});\n"}
+        a = {"src/c.test.ts": "it('c', () => {\n  expect(true).toBe(true);\n});\n"}
+        self.assertIn("loosened-assertion", kinds(findings(b, a)))
+
+    def test_f6_constant_lookalikes_are_not_tautologies(self):
+        for line, lang in (('assert False, "unreachable"', "py"), ("assert f() == 3", "py"),
+                           ("assert 3 == x", "py"), ("expect(true).toBe(false);", "js"),
+                           ("expect(x).toBe(true);", "js"), ("assert 9**9**9 == 1", "py")):
+            with self.subTest(line=line):
+                self.assertFalse(guard.is_tautology(line, lang))
+
+    def test_f6_call_checks_lose_their_arguments(self):
+        b = {"src/m.test.ts": "it('m', () => {\n  expect(g).toHaveBeenCalledWith(1, 2);\n});\n"}
+        a = {"src/m.test.ts": "it('m', () => {\n  expect(g).toHaveBeenCalled();\n});\n"}
+        self.assertEqual(kinds(findings(b, a)), ["loosened-assertion"])
+        self.assertEqual(findings(a, b), [])
+        bp = {"tests/test_m.py": "def test_m(m):\n    m.assert_called_once_with(1, 2)\n"}
+        ap = {"tests/test_m.py": "def test_m(m):\n    m.assert_called_once()\n"}
+        self.assertEqual(kinds(findings(bp, ap)), ["loosened-assertion"])
+
+    def test_f6_equality_becomes_a_range(self):
+        b = {"tests/test_l.py": "def test_l(items):\n    assert len(items) == 3\n"}
+        a = {"tests/test_l.py": "def test_l(items):\n    assert len(items) >= 1\n"}
+        self.assertEqual(kinds(findings(b, a)), ["loosened-assertion"])
+        self.assertEqual(findings(a, b), [])
+        bj = {"src/l.test.ts": "it('l', () => {\n  expect(n()).toBe(3);\n});\n"}
+        aj = {"src/l.test.ts": "it('l', () => {\n  expect(n()).toBeGreaterThan(0);\n});\n"}
+        self.assertEqual(kinds(findings(bj, aj)), ["loosened-assertion"])
+
+    def test_f6_test_class_renamed_out_of_collection(self):
+        b = {"tests/test_k.py": "class TestB:\n    def test_b(self):\n        assert f() == 3\n"}
+        for new, want in (("class B:", ["test-deleted"]), ("class TestBee:", []),
+                          ("class B(unittest.TestCase):", [])):
+            with self.subTest(new=new):
+                a = {"tests/test_k.py": b["tests/test_k.py"].replace("class TestB:", new)}
+                self.assertEqual(kinds(findings(b, a)), want)
+
+    def test_a_crash_is_exit_2_never_exit_1(self):
+        real = guard.detect
+        guard.detect = lambda fds: 1 / 0
+        try:
+            fd, path = tempfile.mkstemp(suffix=".diff")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(open(os.path.join(FIXTURES, "weakened.diff")).read())
+            rc, out = run_main(["--diff-file", path, "--summary-file", ""])
+            os.remove(path)
+        finally:
+            guard.detect = real
+        self.assertEqual(rc, 2)
+        self.assertIn("internal failure", out[-1])
 
 
 class OutputAndExitTests(unittest.TestCase):
@@ -480,7 +685,7 @@ class OutputAndExitTests(unittest.TestCase):
         self.assertEqual(guard._esc_prop("a,b:c%"), "a%2Cb%3Ac%25")
         self.assertEqual(guard._esc_data("x\ny"), "x%0Ay")
 
-    def test_git_mode_reads_the_three_dot_diff_and_the_tree(self):
+    def test_git_mode_reads_the_three_dot_diff_of_a_deleted_test_file(self):
         b = {"src/parse.py": "def parse(t):\n    return int(t)\n",
              "tests/test_parse.py": "def test_parse():\n    assert parse('1') == 1\n"}
         repo = Repo(b, {"tests/test_parse.py": None})

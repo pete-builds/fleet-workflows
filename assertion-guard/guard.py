@@ -8,10 +8,15 @@ Python standard library only, so a caller installs nothing.
 Five finding types, each reported with a file, a line and one plain sentence:
 
   net-assertion-loss      a test file that still exists loses more assertions than it gains
-  loosened-assertion      an exact check replaced by a weaker one in the same change
+  loosened-assertion      an exact check replaced by a weaker one in the same change, or
+                          an added check over constants only, which cannot fail
   skip-added              a skip, xfail or .only was added
-  test-deleted            a test removed and not re-added anywhere in the diff, or a whole
-                          test file deleted while its subject source remains
+  test-deleted            a test removed and not re-added anywhere in the diff; a whole
+                          test file deleted unless its subject source is deleted in the
+                          same diff; a test file or Test class renamed out of collection
+
+Git mode and --diff-file mode read the same diff and decide identically: the guard never
+consults the repository tree.
   coverage-floor-lowered  fail_under, --cov-fail-under, or a vitest/jest threshold lowered
 
 Exit 0: no findings. Exit 1: one or more findings. Exit 2: the guard could not run.
@@ -41,8 +46,11 @@ PY_EXT = (".py",)
 JS_EXT = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
 CODE_EXT = PY_EXT + JS_EXT
 
-# Directories never scanned, even when they contain files that look like tests.
-EXCLUDED_DIRS = ("node_modules/", ".venv/", "venv/", "dist/", "build/", "site-packages/")
+# Directories never scanned, even when they contain files that look like tests. Vendored
+# dependencies are skipped wherever they sit. Build output is skipped only at the repo
+# root: a package or test folder that happens to be named `build` (tests/build/) is source.
+EXCLUDED_ANYWHERE = ("node_modules/", ".venv/", "venv/", "site-packages/")
+EXCLUDED_AT_ROOT = ("dist/", "build/")
 
 COVERAGE_CONFIG_NAMES = {
     "pyproject.toml", "setup.cfg", ".coveragerc", "pytest.ini", "tox.ini", "package.json",
@@ -60,10 +68,11 @@ def language(path: str) -> str | None:
 
 def is_excluded(path: str) -> bool:
     p = "/" + path
-    return any(("/" + d) in p for d in EXCLUDED_DIRS)
+    return any(("/" + d) in p for d in EXCLUDED_ANYWHERE) or path.startswith(EXCLUDED_AT_ROOT)
 
 
 def is_test_file(path: str) -> bool:
+    """In scope: any file a test suite is made of, helpers included."""
     if not path or is_excluded(path) or language(path) is None:
         return False
     parts = path.split("/")
@@ -72,12 +81,33 @@ def is_test_file(path: str) -> bool:
     if language(path) == "py":
         return (
             "tests" in dirs
+            or "test" in dirs
             or base == "conftest.py"
             or (base.startswith("test_") and base.endswith(".py"))
             or base.endswith("_test.py")
         )
-    # TS / JS
-    return "__tests__" in dirs or ".test." in base or ".spec." in base
+    # TS / JS. `test/` is mocha's default directory.
+    return "__tests__" in dirs or "test" in dirs or "tests" in dirs or ".test." in base or ".spec." in base
+
+
+def is_collected(path: str) -> bool:
+    """Would the runner's DEFAULT discovery collect tests from this file? Narrower than
+    is_test_file: tests/helpers.py is part of the suite but holds no collected tests, and
+    tests/test_calc.py renamed to tests/calc_checks.py silently stops running."""
+    if not path or is_excluded(path) or language(path) is None:
+        return False
+    parts = path.split("/")
+    base = parts[-1]
+    if language(path) == "py":
+        return base.startswith("test_") or base.endswith("_test.py")
+    return ("__tests__" in parts[:-1] or "test" in parts[:-1]
+            or ".test." in base or ".spec." in base)
+
+
+def in_scope(fd: "FileDiff") -> bool:
+    """A file is analysed when EITHER side of it is a test file: a test file renamed out of
+    the test paths must be seen, or the rename itself hides the deletion."""
+    return is_test_file(fd.new_path or "") or is_test_file(fd.old_path or "")
 
 
 def is_coverage_config(path: str) -> bool:
@@ -307,23 +337,29 @@ def count_assertions(text: str, lang: str) -> int:
 PY_EXACT = [
     re.compile(r"^assert\b.*[^=!<>]==[^=]"),
     re.compile(r"\bassert(Dict|List|Tuple|Set|Sequence|MultiLine|Count)?Equals?\s*\("),
+    re.compile(r"\.assert_called(_once)?_with\s*\(|\.assert_any_call\s*\(|\.assert_has_calls\s*\("),
 ]
 PY_WEAK = [
+    re.compile(r"\.assert_called(_once)?\s*\("),  # called at all, arguments unchecked
     re.compile(r"^assert\b.*\bis\s+not\s+None\b"),
     re.compile(r"\bassertTrue\s*\("),
     re.compile(r"\bassertIsNotNone\s*\("),
     re.compile(r"\bassertIn\s*\("),
     re.compile(r"^assert\b.*(?<!\bnot)\s+in\s+"),
 ]
+PY_INEQUALITY = re.compile(r"<=|>=|(?<![<>=!-])[<>](?![<>=])")
 # `assert x` with no comparison at all: a bare truthiness check.
 PY_COMPARISON = re.compile(r"==|!=|<=|>=|<|>|\bis\b|\bin\b|\bisinstance\b|\bissubclass\b|\bany\s*\(|\ball\s*\(|\bnot\b")
 JS_EXACT = [
-    re.compile(r"\.(toBe|toEqual|toStrictEqual)\s*\("),
+    re.compile(r"\.(toBe|toEqual|toStrictEqual|toHaveLength)\s*\("),
+    re.compile(r"\.(toHaveBeenCalledWith|toHaveBeenLastCalledWith|toHaveBeenNthCalledWith|toHaveBeenCalledTimes)\s*\("),
     re.compile(r"\bassert\.(equal|strictEqual|deepEqual|deepStrictEqual)\s*\("),
 ]
 JS_WEAK = [
     re.compile(r"\.(toBeDefined|toBeTruthy|toContain|toContainEqual|toMatch|toMatchObject)\s*\("),
     re.compile(r"\.not\.(toBeNull|toBeUndefined)\s*\("),
+    re.compile(r"\.toHaveBeenCalled\s*\("),  # called at all, arguments unchecked
+    re.compile(r"\.(toBeGreaterThan|toBeGreaterThanOrEqual|toBeLessThan|toBeLessThanOrEqual)\s*\("),
     re.compile(r"\bassert\.ok\s*\(|(?<![\w.$])assert\s*\("),
 ]
 
@@ -331,7 +367,8 @@ JS_WEAK = [
 def is_exact(text: str, lang: str) -> bool:
     s = code_part(text, lang)
     pats = PY_EXACT if lang == "py" else JS_EXACT
-    return bool(s) and any(p.search(s) for p in pats)
+    # A check over constants only is not exact about anything (and is reported itself).
+    return bool(s) and any(p.search(s) for p in pats) and not is_tautology(text, lang)
 
 
 def is_weak(text: str, lang: str) -> bool:
@@ -343,6 +380,9 @@ def is_weak(text: str, lang: str) -> bool:
             return True
         if PY_ASSERT_STMT.search(s):
             expr = assert_condition(s)
+            # `assert len(x) == 3` -> `assert len(x) >= 1`: a range where a value was.
+            if PY_INEQUALITY.search(expr) and "==" not in expr:
+                return True
             return not PY_COMPARISON.search(expr) and expr.strip() not in ("", "(")
         return False
     return any(p.search(s) for p in JS_WEAK)
@@ -384,6 +424,9 @@ def check_subject(text: str, lang: str) -> str:
         m = re.match(r"^assert\s+(.*?)\s*==", s)
         if m:
             return norm(m.group(1))
+        m = re.match(r"^(.*?)\.assert_\w+\s*\(", s)  # mock.assert_called_with(...)
+        if m:
+            return norm(m.group(1))
         m = re.search(r"\bassert\w*\s*\(\s*([^,]*)", s)
         return norm(m.group(1)) if m else norm(s)
     m = re.search(r"\bexpect\s*\((.*)\)\s*\.(?:not\.)?to\w*\s*\(", s)
@@ -391,6 +434,66 @@ def check_subject(text: str, lang: str) -> str:
         return norm(m.group(1))
     m = re.search(r"\bassert\.\w+\s*\(\s*([^,]*)", s)
     return norm(m.group(1)) if m else norm(s)
+
+
+JS_LIT = r"(?:-?\d+(?:\.\d+)?|'[^']*'|\"[^\"]*\"|`[^`$]*`|true|false|null|undefined)"
+JS_TAUTOLOGY = re.compile(
+    rf"\bexpect\s*\(\s*({JS_LIT})\s*\)\s*\.(toBe|toEqual|toStrictEqual)\s*\(\s*({JS_LIT})\s*\)"
+    rf"|\bexpect\s*\(\s*(true|-?[1-9]\d*|'[^']+'|\"[^\"]+\")\s*\)\s*\.(toBeTruthy|toBeDefined)\s*\(\s*\)"
+)
+
+
+def _constant_truth(node) -> bool | None:
+    """Value of an expression built only from literals, else None. Evaluated with no
+    names and no builtins, so only constants can run."""
+    import ast
+
+    # No BinOp: `9**9**9` would make the guard itself hang.
+    allowed = (ast.Expression, ast.Constant, ast.Compare, ast.BoolOp, ast.UnaryOp,
+               ast.Tuple, ast.List, ast.cmpop, ast.boolop, ast.unaryop, ast.Load)
+    if not all(isinstance(n, allowed) for n in ast.walk(node)):
+        return None
+    try:
+        return bool(eval(compile(node, "<literal>", "eval"), {"__builtins__": {}}, {}))  # noqa: S307
+    except Exception:
+        return None
+
+
+def is_tautology(text: str, lang: str) -> bool:
+    """An assertion over literals only, which cannot fail: `assert 3 == 3`, `assert True`,
+    `self.assertEqual(1, 1)`, `expect(true).toBe(true)`."""
+    import ast
+
+    s = code_part(text, lang)
+    if not s:
+        return False
+    if lang != "py":
+        m = JS_TAUTOLOGY.search(s)
+        if not m:
+            return False
+        if m.group(1) is not None:  # equality form: only when both sides are the same literal
+            return m.group(1) == m.group(3)
+        return True
+    if PY_ASSERT_STMT.search(s):
+        cond = assert_condition(s).strip()
+        try:
+            tree = ast.parse(cond, mode="eval")
+        except SyntaxError:
+            return False
+        return _constant_truth(tree) is True
+    m = re.search(r"\bself\.assert(Equal|True|IsNotNone)\s*\((.*)\)\s*$", s)
+    if m:
+        try:
+            tree = ast.parse(f"({m.group(2)},)", mode="eval")
+        except SyntaxError:
+            return False
+        args = tree.body.elts
+        if not args or not all(isinstance(a, ast.Constant) for a in args):
+            return False
+        if m.group(1) == "Equal":
+            return len(args) >= 2 and args[0].value == args[1].value
+        return bool(args[0].value) or (m.group(1) == "IsNotNone" and args[0].value is not None)
+    return False
 
 
 RAISES_ARG = re.compile(r"\b(?:pytest\.raises|assertRaises(?:Regex)?)\s*\(\s*([\w.]+)")
@@ -420,6 +523,7 @@ def close_to_digits(text: str) -> int | None:
 SKIP_PY = re.compile(
     r"\bpytest\.mark\.(skip|skipif|xfail)\b|\bunittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
     r"|\bpytest\.(skip|xfail)\s*\(|\bself\.skipTest\s*\(|^@(skip|skipIf|skipUnless|expectedFailure)\b"
+    r"|(?<![\w.])mark\.(skip|skipif|xfail)\b"  # after `from pytest import mark`
 )
 SKIP_JS = re.compile(
     r"(?<![\w.$])(it|test|describe|context|suite)\.(skip|skipIf|only)\b"
@@ -435,6 +539,8 @@ def skip_marker(text: str, lang: str) -> str | None:
     return m.group(0) if m else None
 
 
+PY_TEST_CLASS = re.compile(r"^\s*class\s+(Test\w*)\b")
+PY_ANY_CLASS = re.compile(r"^\s*class\s+(\w+)\b")
 PY_TEST_DEF = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 JS_TEST_DEF = re.compile(
     r"^(\s*)(?:it|test|xit|xtest|fit)(?:\.(?:skip|only|concurrent|skipIf\([^)]*\)|runIf\([^)]*\)))?\s*\(\s*(['\"`])(.+?)\2"
@@ -538,6 +644,28 @@ def renamed_in_place(fds: list[FileDiff]) -> set[int]:
     return out
 
 
+def looks_like_rename(old: TestBlock, new: TestBlock) -> bool:
+    """Is `new` the same test as `old` under another name? Matching on assertion lines
+    alone let an unrelated new test that happened to repeat a generic check
+    (`assert r.status_code == 401`) hide a deleted one (review finding F5). So the whole
+    body must carry over: every assertion, every string literal, and at least 80% of the
+    removed code lines (setup included), or the identical body reformatted."""
+    ol, nl = language(old.fd.path), language(new.fd.path)
+    if not old.assertion_keys(ol) <= new.assertion_keys(nl):
+        return False
+    if not old.literals() <= new.literals() | {new.name}:
+        return False
+    old_lines = [norm(code_part(ln.text, ol)) for ln in old.body]
+    old_lines = [x for x in old_lines if x]
+    new_lines = {norm(code_part(ln.text, nl)) for ln in new.body}
+    if not old_lines:
+        return False
+    if "".join(old_lines) in "".join(norm(code_part(ln.text, nl)) for ln in new.body):
+        return True  # same body, line breaks moved by a formatter
+    kept = sum(1 for x in old_lines if x in new_lines)
+    return kept / len(old_lines) >= 0.8
+
+
 def classify_removed_tests(tests: list[FileDiff]):
     """Decide what happened to every removed test.
 
@@ -580,9 +708,8 @@ def classify_removed_tests(tests: list[FileDiff]):
         if partner:
             result[id(rb.line)] = ("moved", partner)
             continue
-        keys = rb.assertion_keys(lang)
-        if keys:
-            partner = claim(lambda b: keys <= b.assertion_keys(language(b.fd.path)))
+        if rb.assertion_keys(lang):
+            partner = claim(lambda b: looks_like_rename(rb, b))
             if partner:
                 result[id(rb.line)] = ("renamed", partner)
                 continue
@@ -632,9 +759,23 @@ def skip_targets_new_test(fd: FileDiff, hunk: list[Line], idx: int, removed_name
     return target.kind == "+" and t is not None and t[1] not in removed_names
 
 
-def detect(fds: list[FileDiff], tree: set[str] | None = None) -> list[Finding]:
+def detect(fds: list[FileDiff]) -> list[Finding]:
+    """The findings for one diff. Reads the diff only, never the repository tree, so git
+    mode and --diff-file mode decide identically on the same diff."""
     findings: list[Finding] = []
-    tests = [fd for fd in fds if not fd.binary and is_test_file(fd.path)]
+    tests = [fd for fd in fds if not fd.binary and in_scope(fd)]
+
+    # ---- a test file renamed to where the runner no longer collects it ----------------
+    # `git mv tests/test_calc.py attic/calc_checks.py` keeps every line and runs none of
+    # them (review finding F2). Reported as a deletion; the file is not analysed further.
+    for fd in [fd for fd in tests if fd.old_path and fd.new_path and fd.old_path != fd.new_path
+               and is_collected(fd.old_path) and not is_collected(fd.new_path)]:
+        tests.remove(fd)
+        findings.append(Finding(
+            "test-deleted", fd.new_path, 1,
+            f"The test file {fd.old_path} was renamed to {fd.new_path}, where the test "
+            f"runner no longer collects it, so its tests stop running.",
+        ))
     configs = [fd for fd in fds if not fd.binary and is_coverage_config(fd.path)]
 
     removed_tests, status = classify_removed_tests(tests)
@@ -712,6 +853,16 @@ def detect(fds: list[FileDiff], tree: set[str] | None = None) -> list[Finding]:
                 ))
 
     # ---- 2. loosened-assertion -------------------------------------------------------
+    # An added assertion over literals only cannot fail, whatever the code does.
+    for fd in tests:
+        lang = language(fd.path)
+        for ln in fd.lines("+"):
+            if is_tautology(ln.text, lang):
+                findings.append(Finding(
+                    "loosened-assertion", fd.path, ln.new_no,
+                    f"`{ln.text.strip()[:80]}` compares constants, so it passes whatever "
+                    f"the code does.",
+                ))
     for fd in tests:
         lang = language(fd.path)
         for hunk in fd.hunks:
@@ -746,14 +897,18 @@ def detect(fds: list[FileDiff], tree: set[str] | None = None) -> list[Finding]:
                             kept[subj] -= 1
                         else:
                             orphans.append(ln)
+                    # Pair on a shared subject first, so the message quotes the check that
+                    # was really replaced; leftovers pair in order.
                     pairs = []
-                    for old in orphans[:lost]:
-                        if not fresh:
-                            break
-                        subj = check_subject(old.text, lang)
-                        new = next((ln for ln in fresh if subj and subj in norm(ln.text)), fresh[0])
-                        fresh.remove(new)
-                        pairs.append((old, new))
+                    for new in list(fresh):
+                        old = next((o for o in orphans if check_subject(o.text, lang)
+                                    and check_subject(o.text, lang) in norm(new.text)), None)
+                        if old is not None:
+                            orphans.remove(old)
+                            fresh.remove(new)
+                            pairs.append((old, new))
+                    pairs += list(zip(orphans, fresh))
+                    pairs = sorted(pairs[:lost], key=lambda p: p[1].new_no)
                     for old, new in pairs:
                         findings.append(Finding(
                             "loosened-assertion", fd.path, new.new_no,
@@ -846,16 +1001,13 @@ def detect(fds: list[FileDiff], tree: set[str] | None = None) -> list[Finding]:
     }
 
     def subject_remains(path: str) -> bool:
+        # Only a source file deleted in THIS diff excuses a deleted test file. The tree
+        # never does: test files are often named for a feature (test_security.py) rather
+        # than a module, so "no file of that name remains" proved nothing, and in git mode
+        # it let 48 of mcp-unifi's 94 test files be deleted whole with a green guard
+        # (review finding F1).
         stem = subject_stem(path)
-        if stem is None:
-            return True
-        if stem in deleted_source_stems:
-            return False
-        if tree is not None:
-            return any(
-                not is_test_file(p) and p.split("/")[-1].rsplit(".", 1)[0] == stem for p in tree
-            )
-        return True
+        return stem is None or stem not in deleted_source_stems
 
     gone_by_file: dict[str, list[TestBlock]] = {}
     for rb in removed_tests:
@@ -876,6 +1028,28 @@ def detect(fds: list[FileDiff], tree: set[str] | None = None) -> list[Finding]:
                 "test-deleted", fd.path, max(1, rb.line.new_no),
                 f"The test `{rb.name}` was removed and is not re-added anywhere in this change.",
             ))
+
+    # A `class Test*` renamed to a name pytest does not collect: every method in it stops
+    # running while the diff shows one changed line.
+    readded_classes = {
+        m.group(1) for fd in tests if language(fd.path) == "py" for ln in fd.lines("+")
+        if (m := PY_TEST_CLASS.match(ln.text))
+    }
+    for fd in tests:
+        if language(fd.path) != "py":
+            continue
+        for hunk in fd.hunks:
+            for removed, added in change_blocks(hunk):
+                old = [m.group(1) for ln in removed if (m := PY_TEST_CLASS.match(ln.text))]
+                new = [(ln, m.group(1)) for ln in added
+                       if (m := PY_ANY_CLASS.match(ln.text)) and not m.group(1).startswith("Test")
+                       and "TestCase" not in ln.text]
+                for name, (ln, to) in zip([n for n in old if n not in readded_classes], new):
+                    findings.append(Finding(
+                        "test-deleted", fd.path, ln.new_no,
+                        f"The test class {name} was renamed to {to}, which pytest does not "
+                        f"collect, so every test in it stops running.",
+                    ))
 
     # ---- 5. coverage-floor-lowered ---------------------------------------------------
     findings.extend(coverage_findings(configs, fds))
@@ -997,16 +1171,15 @@ def write_summary(path: str, findings: list[Finding], verdict: str) -> None:
 
 
 def git_diff(base: str, head: str) -> str:
-    cmd = ["git", "diff", "--no-color", "--no-ext-diff", "-M", f"{base}...{head}"]
+    # --text, --no-textconv and --no-ext-diff: a PR can add `tests/** -diff` or a diff
+    # driver to .gitattributes, and without these its own test changes would arrive as
+    # "Binary files differ" or as converted text (review finding F3).
+    cmd = ["git", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "-M",
+           f"{base}...{head}"]
     p = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if p.returncode != 0:
         raise RuntimeError(f"`{' '.join(cmd)}` failed: {p.stderr.strip()[:300]}")
     return p.stdout
-
-
-def git_tree(rev: str) -> set[str] | None:
-    p = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev], capture_output=True, text=True)
-    return set(p.stdout.splitlines()) if p.returncode == 0 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1019,7 +1192,6 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        tree = None
         if args.diff_file:
             with open(args.diff_file, encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
@@ -1030,16 +1202,24 @@ def main(argv: list[str] | None = None) -> int:
                     "fills these from the pull_request event)"
                 )
             text = git_diff(args.base, args.head)
-            tree = git_tree(args.head)
         fds = parse_diff(text)
         if text.strip() and not fds:
             raise RuntimeError("input is not empty but contains no `diff --git` sections")
+        unreadable = [fd.path for fd in fds if fd.binary and in_scope(fd)]
+        if unreadable:
+            raise RuntimeError(
+                "test file(s) arrived as binary, so their changes cannot be read: "
+                + ", ".join(unreadable[:5])
+            )
+        findings = detect(fds)
     except (OSError, RuntimeError) as exc:
         print(f"assertion-guard: ERROR: {exc}")
         return 2
+    except Exception as exc:  # a crash must never exit 1 and read as "findings"
+        print(f"assertion-guard: ERROR: internal failure, no verdict: {type(exc).__name__}: {exc}")
+        return 2
 
-    findings = detect(fds, tree)
-    n_tests = sum(1 for fd in fds if not fd.binary and is_test_file(fd.path))
+    n_tests = sum(1 for fd in fds if not fd.binary and in_scope(fd))
     n_cfg = sum(1 for fd in fds if not fd.binary and is_coverage_config(fd.path))
     verdict = verdict_line(len(findings), n_tests, n_cfg, len(fds))
 

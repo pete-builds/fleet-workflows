@@ -103,10 +103,15 @@ plus the config files that hold coverage floors, and reports:
 | Finding | Meaning |
 |---|---|
 | `net-assertion-loss` | a test file that still exists loses more assertions than it gains |
-| `loosened-assertion` | an exact check became a weaker one: `==` to `is not None`, `toEqual` to `toBeDefined`, a specific error to `Exception`, a wider `approx` tolerance, fewer `toBeCloseTo` digits |
+| `loosened-assertion` | an exact check became a weaker one: `==` to `is not None` or `>=`, `toEqual` to `toBeDefined`, `toHaveBeenCalledWith` to `toHaveBeenCalled`, a specific error to `Exception`, a wider `approx` tolerance, fewer `toBeCloseTo` digits; or an added check over constants only (`assert 3 == 3`) |
 | `skip-added` | a skip or xfail on an existing test, or a `.only` anywhere |
-| `test-deleted` | a test removed and not re-added anywhere in the diff (renames, moves and parametrize consolidations are matched), or a whole test file deleted while its subject remains |
+| `test-deleted` | a test removed and not re-added anywhere in the diff (renames, moves and parametrize consolidations are matched); a whole test file deleted, unless the source file it is named for is deleted in the same diff; a test file renamed, or a `class Test*` renamed, to where the runner no longer collects it |
 | `coverage-floor-lowered` | `fail_under`, `--cov-fail-under` or a vitest/jest threshold lowered or removed |
+
+Test files are Python under `tests/` or `test/`, `test_*.py`, `*_test.py`, `conftest.py`, and
+TS/JS under `__tests__/`, `test/`, `tests/`, `*.test.*`, `*.spec.*`. In git mode the diff is
+read with `--text --no-textconv`, so a `.gitattributes` line cannot turn test changes into
+"Binary files differ"; a replayed diff that shows a test file as binary is an error.
 
 Each finding is an `::error` annotation on the line, a row in the step summary, and exit 1.
 The last line is always a verdict, including when no test file changed:
@@ -127,7 +132,7 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pete-builds/fleet-workflows/assertion-guard@<FULL_COMMIT_SHA> # vX.Y.Z
 ```
 
@@ -136,9 +141,14 @@ Offline replay of any diff: `gh pr diff 123 > pr.diff && python3 assertion-guard
 Controls, on every push and pull request (`smoke.yml`): the unit tests, a planted
 `smoke/assertion-guard/weakened.diff` that must produce exactly the findings in
 `weakened.expected`, a `clean-refactor.diff` (a test renamed and moved, assertions added,
-reformatting) that must produce none, and the action itself run end to end on a planted
-commit pair that must fail. `smoke/assertion-guard/build-fixtures.sh` regenerates both
+reformatting) that must produce none, the independent reviewer's probes
+(`smoke/assertion-guard/probes.sh`), and the action itself run end to end on two planted
+commit pairs that must each end with exit 1 and `test-deleted`. Every fixture and probe runs
+in BOTH modes, git mode on a real repo and `--diff-file` on the same change, and the two
+must print identical results. `smoke/assertion-guard/build-fixtures.sh` regenerates the
 fixtures from real git history.
+
+The action's outputs are `exit-code` (0, 1 or 2), `verdict` and `kinds`.
 
 ## Releasing a change
 

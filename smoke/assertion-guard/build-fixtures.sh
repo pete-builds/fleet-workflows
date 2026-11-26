@@ -6,12 +6,24 @@
 #   clean-refactor.diff  a test renamed and moved between files, assertions added,
 #                        reformatting, plus the shapes calibration found legitimate
 #
-# Usage: bash smoke/assertion-guard/build-fixtures.sh   (rewrites both .diff files)
+# Usage: bash smoke/assertion-guard/build-fixtures.sh            rewrites both .diff files
+#        bash smoke/assertion-guard/build-fixtures.sh --repo DIR  builds the fixture repo in
+#        DIR (branches main, weakened, clean) and writes nothing else; check.sh uses this to
+#        run the guard in git mode, the way CI runs it, next to the --diff-file run.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+repo_only=""
+if [ "${1:-}" = "--repo" ]; then
+  repo_only="${2:?usage: build-fixtures.sh --repo DIR}"
+fi
+if [ -n "$repo_only" ]; then
+  mkdir -p "$repo_only"
+  work="$(cd "$repo_only" && pwd)"
+else
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+fi
 cd "$work"
 git init -q -b main .
 git config user.email fixture@example.invalid
@@ -265,6 +277,12 @@ fail_under = 90
 EOF
 git add -A
 git commit -qm clean
+
+if [ -n "$repo_only" ]; then
+  git checkout -q main
+  echo "built fixture repo at $work (branches main, weakened, clean)"
+  exit 0
+fi
 
 git diff --no-color -M main...weakened > "$here/weakened.diff"
 git diff --no-color -M main...clean > "$here/clean-refactor.diff"
