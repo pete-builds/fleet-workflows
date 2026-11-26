@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/runner-py"
-          "$RUNNER_TEMP/runner-py/bin/pip" install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.lock
+          "$RUNNER_TEMP/runner-py/bin/pip" install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.txt
           npm ci --prefix smoke/assertion-guard/runner-js --ignore-scripts --no-audit --no-fund
       - name: Collection-diff fixtures (every round-three hole red, judged by the runner)
         env:
@@ -127,7 +127,7 @@ jobs:
         with:
           base: ${{ env.ctl_base }}
           head: ${{ env.ctl_head }}
-          collect-setup: python -m pip install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.lock
+          collect-setup: python -m pip install -q --require-hashes -r smoke/assertion-guard/runner-py/requirements.txt
           collect-command: python -m pytest --collect-only -q -p no:cacheprovider ctl-planted
       - name: Require exit 1 and test-deleted from all three
         env:
