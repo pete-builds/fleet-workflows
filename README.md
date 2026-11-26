@@ -103,6 +103,54 @@ implementation.
 3. Tag a release (`vX.Y.Z`). Dependabot in each caller repo picks up the new tag and
    opens per-repo SHA-bump PRs.
 
+## Halt switch
+
+One flag that stops every unattended writer in the fleet at once.
+
+**Set it:** create a file named `HALT` at the root of `main` in this repo. Its first line is
+the reason every writer prints. One commit from any device, the GitHub app included.
+
+**Clear it:** delete `HALT` from `main`.
+
+**How fast:** writers read `https://raw.githubusercontent.com/pete-builds/fleet-workflows/main/HALT`,
+and GitHub's raw CDN caches for up to about 5 minutes. A halt takes effect within 5
+minutes, and so does clearing it. That is accepted for jobs that run hourly or nightly.
+
+**The contract** (`halt-check/halt-check.sh`, one POSIX script, prints exactly one line):
+
+| Reader sees | Line | Exit | Writers |
+|---|---|---|---|
+| `HALT` answers 404 and `halt-check/ALIVE` answers 200 | `halt-check: clear` | 0 | proceed |
+| `HALT` answers 200 | `halt-check: HALTED: <first line of HALT>` | 3 | write nothing |
+| anything else (timeout, 5xx, DNS, `ALIVE` missing, no curl) | `halt-check: UNKNOWN: <detail>` | 4 | write nothing |
+
+Unattended writers proceed only on exit 0, so an unreadable switch fails closed. A 404 only
+counts as clear while the `ALIVE` marker answers, because a renamed, deleted or private
+repo would also 404. **Do not delete `halt-check/ALIVE`.** Interactive Claude sessions deny
+writes on 3 and warn on 4, because Pete is present.
+
+`halt-check.sh` is canonical here and copied byte for byte wherever a tier cannot call the
+action; the weekly drill compares every copy's sha256 with this one, and `halt-smoke` pins
+the hash, so changing it means updating every copy together.
+
+**In a workflow:**
+
+```yaml
+      - uses: pete-builds/fleet-workflows/halt-check@<FULL_COMMIT_SHA> # vX.Y.Z
+        # fails the job unless clear; outputs: state (clear|halted|unknown), line
+```
+
+Set `fail-unless-clear: 'false'` to only report and act on `steps.<id>.outputs.state`
+yourself. `lockfile-recompile` reads the switch right before its only write: when not
+clear it pushes nothing, opens nothing, writes the reason to the step summary and a notice,
+and ends green.
+
+**Drills** never touch the real flag. `FLEET_HALT_URL` replaces the flag URL and
+`FLEET_HALT_ALIVE_URL` the marker URL. `halt-drill/HALT` always exists (reads halted);
+`halt-drill/CLEAR-does-not-exist` never does (reads clear while `ALIVE` answers). The
+`halt-smoke` workflow runs every outcome on every push and pull request, including a
+recompile that must write nothing when halted and must reach its write step when clear.
+
 ## What does not belong here
 
 Anything needing cross-repo credentials. This repo holds logic only; every execution is

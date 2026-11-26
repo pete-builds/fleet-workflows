@@ -1,0 +1,60 @@
+name: halt-check
+description: >-
+  Read the fleet-wide halt switch (a HALT file on main of pete-builds/fleet-workflows)
+  before an unattended write. Outputs state (clear, halted or unknown) and the reader's
+  one line. By default the step fails unless the switch is clear, so a caller that never
+  reads the outputs still stops.
+
+# THE CONTRACT (binding on every reader; full text in the README "Halt switch" section)
+#   clear    HALT answers 404 AND halt-check/ALIVE answers 200       -> proceed
+#   halted   HALT answers 200; its first line is the reason          -> do not write
+#   unknown  anything else: timeout, 5xx, DNS, ALIVE missing, no curl -> do not write
+# Unattended writers proceed only on clear. Unknown is not clear: fail closed.
+#
+# DRILLS
+#   Set FLEET_HALT_URL (and FLEET_HALT_ALIVE_URL) in the env of the step that uses this
+#   action. Point FLEET_HALT_URL at halt-drill/HALT to read halted, or at
+#   halt-drill/CLEAR-does-not-exist to read clear. The real switch is never touched.
+
+inputs:
+  fail-unless-clear:
+    description: >-
+      When 'true' (the default) the step fails unless the switch reads clear. Set 'false'
+      to only report, and act on the `state` output yourself. Any value other than
+      'false' fails closed.
+    required: false
+    default: 'true'
+
+outputs:
+  state:
+    description: clear, halted or unknown.
+    value: ${{ steps.check.outputs.state }}
+  line:
+    description: >-
+      The reader's single line, for example "halt-check: HALTED: <reason>".
+    value: ${{ steps.check.outputs.line }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read the fleet halt switch
+      id: check
+      shell: bash
+      env:
+        FAIL_UNLESS_CLEAR: ${{ inputs.fail-unless-clear }}
+      run: |
+        if [ "$FAIL_UNLESS_CLEAR" = "false" ]; then
+          consequence="Reported only (fail-unless-clear is false): the calling job decides."
+        else
+          consequence="The calling job stops here."
+        fi
+        bash "${GITHUB_ACTION_PATH}/gha-step.sh" "$consequence"
+
+    - name: Stop unless clear
+      if: inputs.fail-unless-clear != 'false' && steps.check.outputs.state != 'clear'
+      shell: bash
+      env:
+        LINE: ${{ steps.check.outputs.line }}
+      run: |
+        echo "::error title=fleet halt switch::${LINE//%/%25}"
+        exit 1
