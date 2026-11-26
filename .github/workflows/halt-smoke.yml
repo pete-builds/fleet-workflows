@@ -1,0 +1,179 @@
+name: halt-smoke
+
+# PERMANENT CONTROLS for the fleet halt switch, on every push to main and every PR.
+#
+# Every job here reads drill URLs built from THIS commit's SHA, never the real switch, so
+# a drill can neither trip nor clear Pete's HALT file. On a pull request the drill files
+# are not on main yet, which is why the SHA and not `main` is in the URL.
+#
+# Every job holds a READ-ONLY token. That is part of the control, not just hygiene: if the
+# halt gate in lockfile-recompile ever stopped working, its push would be refused and the
+# run would go red, instead of quietly opening a smoke PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: halt-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RAW: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  # The reader itself, every outcome of the contract: halted 3, clear 0, ALIVE missing 4,
+  # unreachable 4. Plus the sha256 pin that keeps vendored copies honest.
+  reader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every outcome of the contract, live
+        run: bash smoke/halt-check/check.sh "$RAW"
+
+  # The composite action as a caller uses it: halted must fail by default (a caller that
+  # ignores outputs still stops), report-only must not, clear must pass.
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Drill flag, report only (must succeed with state halted)
+        id: report
+        uses: ./halt-check
+        env:
+          FLEET_HALT_URL: ${{ env.RAW }}/halt-drill/HALT
+        with:
+          fail-unless-clear: 'false'
+
+      - name: Drill flag, default (must fail)
+        id: fail_default
+        continue-on-error: true
+        uses: ./halt-check
+        env:
+          FLEET_HALT_URL: ${{ env.RAW }}/halt-drill/HALT
+
+      - name: 'Unreachable switch, default (must fail, unknown is not clear)'
+        id: fail_unknown
+        continue-on-error: true
+        uses: ./halt-check
+        env:
+          FLEET_HALT_URL: https://127.0.0.1:9/x
+
+      - name: Drill clear (must succeed with state clear)
+        id: clear
+        uses: ./halt-check
+        env:
+          FLEET_HALT_URL: ${{ env.RAW }}/halt-drill/CLEAR-does-not-exist
+          FLEET_HALT_ALIVE_URL: ${{ env.RAW }}/halt-check/ALIVE
+
+      - name: Require each outcome
+        env:
+          REPORT_STATE: ${{ steps.report.outputs.state }}
+          REPORT_LINE: ${{ steps.report.outputs.line }}
+          FAIL_DEFAULT: ${{ steps.fail_default.outcome }}
+          FAIL_UNKNOWN: ${{ steps.fail_unknown.outcome }}
+          CLEAR_STATE: ${{ steps.clear.outputs.state }}
+        run: |
+          set -u
+          bad=0
+          [ "$REPORT_STATE" = halted ] || { echo "::error::report-only drill: state '$REPORT_STATE', want halted"; bad=1; }
+          case "$REPORT_LINE" in
+            "halt-check: HALTED: Drill flag"*) ;;
+            *) echo "::error::report-only drill: line '$REPORT_LINE'"; bad=1 ;;
+          esac
+          [ "$FAIL_DEFAULT" = failure ] || { echo "::error::halted drill with defaults ended '$FAIL_DEFAULT', want failure"; bad=1; }
+          [ "$FAIL_UNKNOWN" = failure ] || { echo "::error::unreachable switch with defaults ended '$FAIL_UNKNOWN', want failure"; bad=1; }
+          [ "$CLEAR_STATE" = clear ] || { echo "::error::clear drill: state '$CLEAR_STATE', want clear"; bad=1; }
+          if [ "$bad" -ne 0 ]; then echo "halt action controls: FAIL"; exit 1; fi
+          echo "halt action controls: PASS (halted reported, halted failed, unknown failed, clear passed)"
+
+  # lockfile-recompile must write NOTHING when halted, and must try to write when clear.
+  #
+  # smoke/requirements.lock is deliberately stale, so the recompile always has a change to
+  # push. Halted: the action must finish green with halt-state halted, no local branch, no
+  # new commit, the remote branch and open PRs unchanged. Clear: the action must reach its
+  # write step (it creates the local branch and commits) and then fail, because this job's
+  # token cannot push. That second half proves the gate is not stuck shut.
+  recompile-halted-writes-nothing:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Record the state of everything the action could write
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "start_sha=$(git rev-parse HEAD)"
+            echo "remote_before=$(git ls-remote origin refs/heads/lockfile-recompile | cut -f1)"
+            echo "prs_before=$(gh pr list --head lockfile-recompile --state open --json number --jq '[.[].number]|join(",")')"
+          } >> "$GITHUB_ENV"
+
+      - name: Recompile with the drill flag set (must write nothing)
+        id: halted
+        uses: ./lockfile-recompile
+        env:
+          FLEET_HALT_URL: ${{ env.RAW }}/halt-drill/HALT
+        with:
+          uv-version: '0.12.5'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require that nothing was written
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGED: ${{ steps.halted.outputs.changed }}
+          HALT_STATE: ${{ steps.halted.outputs.halt-state }}
+          HALT_LINE: ${{ steps.halted.outputs.halt-line }}
+        run: |
+          set -uo pipefail
+          bad=0
+          # Precondition: without a change to push, "wrote nothing" proves nothing.
+          [ -n "$CHANGED" ] || { echo "::error::recompile changed nothing, so this control tests nothing"; bad=1; }
+          [ "$HALT_STATE" = halted ] || { echo "::error::halt-state '$HALT_STATE' ($HALT_LINE), want halted"; bad=1; }
+          [ "$(git rev-parse HEAD)" = "$start_sha" ] || { echo "::error::HEAD moved: the action committed"; bad=1; }
+          if git rev-parse --verify --quiet refs/heads/lockfile-recompile >/dev/null; then
+            echo "::error::a local lockfile-recompile branch exists: the write step ran"; bad=1
+          fi
+          remote_after="$(git ls-remote origin refs/heads/lockfile-recompile | cut -f1)"
+          [ "$remote_after" = "$remote_before" ] || { echo "::error::remote branch moved $remote_before -> $remote_after"; bad=1; }
+          prs_after="$(gh pr list --head lockfile-recompile --state open --json number --jq '[.[].number]|join(",")')"
+          [ "$prs_after" = "$prs_before" ] || { echo "::error::open recompile PRs changed '$prs_before' -> '$prs_after'"; bad=1; }
+          if [ "$bad" -ne 0 ]; then echo "halted recompile control: FAIL"; exit 1; fi
+          echo "halted recompile control: PASS (changed: $CHANGED; $HALT_LINE; no commit, no branch, remote and PRs unchanged)"
+
+      - name: Restore the stale lock for the clear run
+        run: git checkout -- smoke/requirements.lock && git diff --exit-code
+
+      - name: Recompile with the drill clear (must reach the write and be refused)
+        id: clear
+        continue-on-error: true
+        uses: ./lockfile-recompile
+        env:
+          FLEET_HALT_URL: ${{ env.RAW }}/halt-drill/CLEAR-does-not-exist
+          FLEET_HALT_ALIVE_URL: ${{ env.RAW }}/halt-check/ALIVE
+        with:
+          uv-version: '0.12.5'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require that the clear run tried to write
+        env:
+          OUTCOME: ${{ steps.clear.outcome }}
+        run: |
+          set -uo pipefail
+          bad=0
+          [ "$OUTCOME" = failure ] || { echo "::error::clear run ended '$OUTCOME': with a read-only token only a refused write can fail it"; bad=1; }
+          git rev-parse --verify --quiet refs/heads/lockfile-recompile >/dev/null \
+            || { echo "::error::no local lockfile-recompile branch: the clear run never reached its write step"; bad=1; }
+          remote_after="$(git ls-remote origin refs/heads/lockfile-recompile | cut -f1)"
+          [ "$remote_after" = "$remote_before" ] || { echo "::error::remote branch moved on the clear run: this job's token is not read-only"; bad=1; }
+          if [ "$bad" -ne 0 ]; then echo "clear recompile control: FAIL"; exit 1; fi
+          echo "clear recompile control: PASS (reached the write step, push refused, remote unchanged)"

@@ -30,6 +30,17 @@ inputs:
       caller must grant contents:write and pull-requests:write.
     required: true
 
+outputs:
+  changed:
+    description: Space-separated lock paths the recompile changed (empty when none).
+    value: ${{ steps.recompile.outputs.changed }}
+  halt-state:
+    description: 'The fleet halt switch as read before writing: clear, halted or unknown.'
+    value: ${{ steps.halt.outputs.state }}
+  halt-line:
+    description: The halt reader's single line.
+    value: ${{ steps.halt.outputs.line }}
+
 runs:
   using: composite
   steps:
@@ -49,8 +60,21 @@ runs:
         bash "${GITHUB_ACTION_PATH}/recompile-locks.sh" | tee -a "$GITHUB_OUTPUT"
         echo "uv_version=$(uv --version 2>&1 | head -1)" >> "$GITHUB_OUTPUT"
 
+    # THE FLEET HALT SWITCH, read immediately before the only step that writes (branch
+    # push, PR open or update). Anything but clear means write nothing: halted is Pete's
+    # stop, and unknown (switch unreadable) fails closed. Not clear is NOT a red run: the
+    # recompile above is local only, the reason goes to the step summary and a notice, and
+    # the run ends green having written nothing. The reader lives in this same repo, so it
+    # is pinned by the same SHA as this action.
+    - name: Read the fleet halt switch before any write
+      id: halt
+      shell: bash
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../halt-check/gha-step.sh" \
+          "lockfile-recompile wrote nothing: no branch push, no pull request."
+
     - name: Open or update the pull request
-      if: steps.recompile.outputs.changed != ''
+      if: steps.recompile.outputs.changed != '' && steps.halt.outputs.state == 'clear'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}

@@ -57,6 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./lockfile-recompile
+        env:
+          # The REAL halt switch on main still applies (FLEET_HALT_URL is left alone), so
+          # Pete's HALT stops this smoke too. Only the ALIVE marker is read at this commit,
+          # so a dispatch on a branch works before halt-check/ALIVE reaches main.
+          FLEET_HALT_ALIVE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/halt-check/ALIVE
         with:
           uv-version: '0.12.5'
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -133,6 +138,11 @@ jobs:
           echo "OK: remote branch present, local tracking ref absent. This is the failing case."
 
       - uses: ./lockfile-recompile
+        env:
+          # The REAL halt switch on main still applies (FLEET_HALT_URL is left alone), so
+          # Pete's HALT stops this smoke too. Only the ALIVE marker is read at this commit,
+          # so a dispatch on a branch works before halt-check/ALIVE reaches main.
+          FLEET_HALT_ALIVE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/halt-check/ALIVE
         with:
           uv-version: '0.12.5'
           github-token: ${{ secrets.GITHUB_TOKEN }}
